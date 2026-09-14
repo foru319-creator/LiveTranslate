@@ -1,121 +1,95 @@
 import { useState } from 'react'
-import heroImg from './assets/hero.png'
-import reactLogo from './assets/react.svg'
-import viteLogo from './assets/vite.svg'
 import './App.css'
 
+const languages = [
+  'עברית',
+  'English',
+  'Español',
+  'Français',
+  'Deutsch',
+  'Italiano',
+  'Português',
+  'Русский',
+  'العربية',
+  'Türkçe',
+  '中文',
+  '日本語',
+  '한국어',
+]
+
 function App() {
-  const [count, setCount] = useState(0)
+  const [targetLanguage, setTargetLanguage] = useState('עברית')
+  const [isActive, setIsActive] = useState(false)
 
   return (
-    <>
-      <section id="center">
-        <div className="hero">
-          <img src={heroImg} className="base" width="170" height="179" alt="" />
-          <img src={reactLogo} className="framework" alt="React logo" />
-          <img src={viteLogo} className="vite" alt="Vite logo" />
+    <main className="app-shell" dir="rtl">
+      <section className="hero-card">
+        <div className="logo-badge" aria-hidden="true">🌐</div>
+        <p className="eyebrow">Live Translate</p>
+        <h1>תרגום חי לכל סרטון</h1>
+        <p className="subtitle">
+          מזהה אוטומטית את שפת הסרטון ומציג כתוביות מתורגמות בשפה שתבחרי.
+        </p>
+      </section>
+
+      <section className="settings-card" aria-label="הגדרות תרגום">
+        <div className="field-group">
+          <label htmlFor="source-language">שפת הסרטון</label>
+          <div className="readonly-field" id="source-language">
+            <span className="field-icon">✨</span>
+            <div>
+              <strong>זיהוי אוטומטי</strong>
+              <small>האפליקציה תזהה לבד באיזו שפה מדברים</small>
+            </div>
+          </div>
         </div>
-        <div>
-          <h1>Get started</h1>
-          <p>
-            Edit <code>src/App.jsx</code> and save to test <code>HMR</code>
-          </p>
+
+        <div className="field-group">
+          <label htmlFor="target-language">תרגם ל־</label>
+          <select
+            id="target-language"
+            value={targetLanguage}
+            onChange={(event) => setTargetLanguage(event.target.value)}
+          >
+            {languages.map((language) => (
+              <option key={language} value={language}>
+                {language}
+              </option>
+            ))}
+          </select>
         </div>
+
         <button
           type="button"
-          className="counter"
-          onClick={() => setCount((count) => count + 1)}
+          className={`primary-button ${isActive ? 'active' : ''}`}
+          onClick={() => setIsActive((current) => !current)}
         >
-          Count is {count}
+          <span className="button-dot" />
+          {isActive ? 'עצור תרגום' : 'הפעל תרגום'}
         </button>
-      </section>
 
-      <div className="ticks"></div>
-
-      <section id="next-steps">
-        <div id="docs">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#documentation-icon"></use>
-          </svg>
-          <h2>Documentation</h2>
-          <p>Your questions, answered</p>
-          <ul>
-            <li>
-              <a href="https://vite.dev/" target="_blank">
-                <img className="logo" src={viteLogo} alt="" />
-                Explore Vite
-              </a>
-            </li>
-            <li>
-              <a href="https://react.dev/" target="_blank">
-                <img className="button-icon" src={reactLogo} alt="" />
-                Learn more
-              </a>
-            </li>
-          </ul>
-        </div>
-        <div id="social">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#social-icon"></use>
-          </svg>
-          <h2>Connect with us</h2>
-          <p>Join the Vite community</p>
-          <ul>
-            <li>
-              <a href="https://github.com/vitejs/vite" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#github-icon"></use>
-                </svg>
-                GitHub
-              </a>
-            </li>
-            <li>
-              <a href="https://chat.vite.dev/" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#discord-icon"></use>
-                </svg>
-                Discord
-              </a>
-            </li>
-            <li>
-              <a href="https://x.com/vite_js" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#x-icon"></use>
-                </svg>
-                X.com
-              </a>
-            </li>
-            <li>
-              <a href="https://bsky.app/profile/vite.dev" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#bluesky-icon"></use>
-                </svg>
-                Bluesky
-              </a>
-            </li>
-          </ul>
+        <div className={`status-box ${isActive ? 'active' : ''}`}>
+          <span className="status-icon">{isActive ? '●' : '○'}</span>
+          <div>
+            <strong>{isActive ? 'התרגום פעיל' : 'מוכן להפעלה'}</strong>
+            <small>
+              {isActive
+                ? `כתוביות יתורגמו ל־${targetLanguage}`
+                : 'בהמשך הכפתור הצף יעבוד מעל Instagram, Facebook והדפדפן'}
+            </small>
+          </div>
         </div>
       </section>
 
-      <div className="ticks"></div>
-      <section id="spacer"></section>
-    </>
+      <section className="how-it-works">
+        <h2>איך זה יעבוד?</h2>
+        <div className="steps">
+          <div className="step"><span>1</span><p>פותחים סרטון</p></div>
+          <div className="step"><span>2</span><p>לוחצים על הכפתור הצף</p></div>
+          <div className="step"><span>3</span><p>מקבלים כתוביות מתורגמות</p></div>
+        </div>
+      </section>
+    </main>
   )
 }
 
