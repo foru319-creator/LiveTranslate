@@ -24,12 +24,21 @@ import android.view.View;
 import android.view.WindowManager;
 import android.widget.TextView;
 
+import com.google.mlkit.common.model.DownloadConditions;
+import com.google.mlkit.nl.languageid.LanguageIdentification;
+import com.google.mlkit.nl.languageid.LanguageIdentifier;
+import com.google.mlkit.nl.translate.TranslateLanguage;
+import com.google.mlkit.nl.translate.Translation;
+import com.google.mlkit.nl.translate.Translator;
+import com.google.mlkit.nl.translate.TranslatorOptions;
+
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Map;
 
 public class OverlayService extends Service {
     private WindowManager windowManager;
-    private View floatingButton;
-    private TextView closeButton;
+    private TextView floatingButton;
     private TextView statusView;
     private TextView subtitleView;
     private boolean receiverRegistered = false;
@@ -40,6 +49,14 @@ public class OverlayService extends Service {
     private boolean speechListening = false;
     private boolean captureActive = false;
     private String detectedLanguage = "";
+
+    private boolean closeArmed = false;
+    private GradientDrawable normalButtonBackground;
+    private GradientDrawable closeButtonBackground;
+
+    private LanguageIdentifier languageIdentifier;
+    private final Map<String, Translator> translators = new HashMap<>();
+    private long translationRequestId = 0L;
 
     private final BroadcastReceiver captureStatusReceiver = new BroadcastReceiver() {
         @Override
@@ -55,9 +72,9 @@ public class OverlayService extends Service {
     public void onCreate() {
         super.onCreate();
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
+        languageIdentifier = LanguageIdentification.getClient();
         registerCaptureReceiver();
         showFloatingButton();
-        showCloseButton();
         showSubtitleView();
         showStatusView();
         setupSpeechRecognizer();
@@ -80,10 +97,7 @@ public class OverlayService extends Service {
         }
 
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            if (subtitleView != null) {
-                subtitleView.setText("זיהוי הדיבור של Android אינו זמין במכשיר");
-                subtitleView.setVisibility(View.VISIBLE);
-            }
+            showSubtitleMessage("זיהוי הדיבור של Android אינו זמין במכשיר");
             return;
         }
 
@@ -100,16 +114,15 @@ public class OverlayService extends Service {
                 speechListening = false;
                 if (!captureActive) return;
 
-                if (error == SpeechRecognizer.ERROR_NO_MATCH ||
-                        error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
+                if (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
                     scheduleSpeechRestart(500L);
                 } else if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) {
                     scheduleSpeechRestart(900L);
                 } else if (error == SpeechRecognizer.ERROR_AUDIO) {
-                    showRecognizedText("זיהוי דיבור: לא התקבל קול מהמיקרופון");
+                    showSubtitleMessage("זיהוי דיבור: לא התקבל קול מהמיקרופון");
                     scheduleSpeechRestart(1200L);
                 } else if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
-                    showRecognizedText("נדרש אישור מיקרופון לזיהוי הדיבור");
+                    showSubtitleMessage("נדרש אישור מיקרופון לזיהוי הדיבור");
                 } else {
                     scheduleSpeechRestart(1000L);
                 }
@@ -153,7 +166,7 @@ public class OverlayService extends Service {
             speechRecognizer.startListening(speechIntent);
         } catch (Exception e) {
             speechListening = false;
-            showRecognizedText("לא הצלחנו להפעיל את זיהוי הדיבור");
+            showSubtitleMessage("לא הצלחנו להפעיל את זיהוי הדיבור");
         }
     }
 
@@ -176,16 +189,96 @@ public class OverlayService extends Service {
         if (matches == null || matches.isEmpty()) return;
         String text = matches.get(0);
         if (text == null || text.trim().isEmpty()) return;
-        showRecognizedText(text.trim());
+        translateToHebrew(text.trim());
     }
 
-    private void showRecognizedText(String text) {
-        if (subtitleView == null) return;
-        if (detectedLanguage != null && !detectedLanguage.isEmpty()) {
-            subtitleView.setText("[" + detectedLanguage + "]  " + text);
-        } else {
-            subtitleView.setText(text);
+    private void translateToHebrew(String text) {
+        if (subtitleView == null || text == null || text.isEmpty()) return;
+        final long requestId = ++translationRequestId;
+
+        String speechLanguage = normalizeLanguageTag(detectedLanguage);
+        String mlKitLanguage = speechLanguage == null ? null : TranslateLanguage.fromLanguageTag(speechLanguage);
+
+        if (mlKitLanguage != null) {
+            translateWithLanguage(text, mlKitLanguage, requestId);
+            return;
         }
+
+        languageIdentifier.identifyLanguage(text)
+                .addOnSuccessListener(languageCode -> {
+                    if (requestId != translationRequestId) return;
+                    if (languageCode == null || "und".equals(languageCode)) {
+                        showSubtitleMessage("לא הצלחתי לזהות את שפת הדיבור: " + text);
+                        return;
+                    }
+                    String sourceLanguage = TranslateLanguage.fromLanguageTag(languageCode);
+                    if (sourceLanguage == null) {
+                        showSubtitleMessage("השפה שזוהתה עדיין לא נתמכת בתרגום: " + text);
+                        return;
+                    }
+                    translateWithLanguage(text, sourceLanguage, requestId);
+                })
+                .addOnFailureListener(e -> {
+                    if (requestId == translationRequestId) {
+                        showSubtitleMessage("לא הצלחתי לזהות את שפת הדיבור: " + text);
+                    }
+                });
+    }
+
+    private void translateWithLanguage(String text, String sourceLanguage, long requestId) {
+        if (TranslateLanguage.HEBREW.equals(sourceLanguage)) {
+            if (requestId == translationRequestId) showSubtitleMessage(text);
+            return;
+        }
+
+        Translator translator = translators.get(sourceLanguage);
+        if (translator == null) {
+            TranslatorOptions options = new TranslatorOptions.Builder()
+                    .setSourceLanguage(sourceLanguage)
+                    .setTargetLanguage(TranslateLanguage.HEBREW)
+                    .build();
+            translator = Translation.getClient(options);
+            translators.put(sourceLanguage, translator);
+        }
+
+        final Translator finalTranslator = translator;
+        if (requestId == translationRequestId) {
+            showSubtitleMessage("מתרגם לעברית…");
+            if (statusView != null) statusView.setText("🎧 קולט שמע • 🎤 מזהה מילים • 🌐 מתרגם לעברית");
+        }
+
+        DownloadConditions conditions = new DownloadConditions.Builder().build();
+        finalTranslator.downloadModelIfNeeded(conditions)
+                .addOnSuccessListener(unused -> finalTranslator.translate(text)
+                        .addOnSuccessListener(translatedText -> {
+                            if (requestId != translationRequestId) return;
+                            showSubtitleMessage(translatedText);
+                            if (statusView != null && captureActive) {
+                                statusView.setText("🎧 קולט שמע • 🎤 מזהה מילים • 🌐 עברית");
+                            }
+                        })
+                        .addOnFailureListener(e -> {
+                            if (requestId == translationRequestId) {
+                                showSubtitleMessage("שגיאה בתרגום. הטקסט שזוהה: " + text);
+                            }
+                        }))
+                .addOnFailureListener(e -> {
+                    if (requestId == translationRequestId) {
+                        showSubtitleMessage("מוריד מודל תרגום… נדרש חיבור לאינטרנט בפעם הראשונה");
+                    }
+                });
+    }
+
+    private String normalizeLanguageTag(String language) {
+        if (language == null) return null;
+        String value = language.trim();
+        if (value.isEmpty()) return null;
+        return value.replace('_', '-');
+    }
+
+    private void showSubtitleMessage(String text) {
+        if (subtitleView == null) return;
+        subtitleView.setText(text);
         subtitleView.setVisibility(View.VISIBLE);
     }
 
@@ -194,12 +287,17 @@ public class OverlayService extends Service {
         button.setText("🌐");
         button.setTextSize(24f);
         button.setGravity(Gravity.CENTER);
-        button.setElevation(12f);
+        button.setElevation(50f);
 
-        GradientDrawable background = new GradientDrawable();
-        background.setColor(0xFF6D5DFB);
-        background.setShape(GradientDrawable.OVAL);
-        button.setBackground(background);
+        normalButtonBackground = new GradientDrawable();
+        normalButtonBackground.setColor(0xFF6D5DFB);
+        normalButtonBackground.setShape(GradientDrawable.OVAL);
+
+        closeButtonBackground = new GradientDrawable();
+        closeButtonBackground.setColor(0xFFE53935);
+        closeButtonBackground.setShape(GradientDrawable.OVAL);
+
+        button.setBackground(normalButtonBackground);
 
         int size = dp(64);
         WindowManager.LayoutParams params = new WindowManager.LayoutParams(
@@ -221,12 +319,13 @@ public class OverlayService extends Service {
             private boolean moved;
             private boolean longPressed;
             private Runnable longPressRunnable;
-            private final int moveTolerance = dp(24);
+            private final int moveTolerance = dp(28);
 
             @Override
             public boolean onTouch(View view, MotionEvent event) {
                 switch (event.getAction()) {
                     case MotionEvent.ACTION_DOWN:
+                        if (closeArmed) return true;
                         initialX = params.x;
                         initialY = params.y;
                         initialTouchX = event.getRawX();
@@ -234,15 +333,16 @@ public class OverlayService extends Service {
                         moved = false;
                         longPressed = false;
                         longPressRunnable = () -> {
-                            if (!moved) {
+                            if (!moved && !closeArmed) {
                                 longPressed = true;
-                                showCloseControl();
+                                armCloseButton();
                             }
                         };
                         handler.postDelayed(longPressRunnable, 500L);
                         return true;
 
                     case MotionEvent.ACTION_MOVE:
+                        if (closeArmed) return true;
                         float dx = event.getRawX() - initialTouchX;
                         float dy = event.getRawY() - initialTouchY;
                         if (!longPressed && (Math.abs(dx) > moveTolerance || Math.abs(dy) > moveTolerance)) {
@@ -253,22 +353,17 @@ public class OverlayService extends Service {
                             params.x = initialX - (int) dx;
                             params.y = initialY + (int) dy;
                             windowManager.updateViewLayout(floatingButton, params);
-                            updateCloseButtonPosition(params);
                         }
                         return true;
 
                     case MotionEvent.ACTION_UP:
                         if (longPressRunnable != null) handler.removeCallbacks(longPressRunnable);
-                        if (longPressed) {
-                            showCloseControl();
+                        if (closeArmed) {
+                            if (!longPressed) closeOverlayCompletely();
                             return true;
                         }
-                        if (!moved) {
-                            hideCloseControl();
-                            Intent toggleIntent = new Intent(OverlayService.this, AudioCaptureService.class);
-                            toggleIntent.setAction(AudioCaptureService.ACTION_TOGGLE);
-                            startService(toggleIntent);
-                        }
+                        if (longPressed) return true;
+                        if (!moved) toggleCapture();
                         return true;
 
                     case MotionEvent.ACTION_CANCEL:
@@ -283,56 +378,30 @@ public class OverlayService extends Service {
         windowManager.addView(floatingButton, params);
     }
 
-    private void showCloseButton() {
-        TextView close = new TextView(this);
-        close.setText("✕");
-        close.setTextColor(Color.WHITE);
-        close.setTextSize(22f);
-        close.setGravity(Gravity.CENTER);
-        close.setElevation(50f);
-        close.setVisibility(View.GONE);
-
-        GradientDrawable background = new GradientDrawable();
-        background.setColor(0xFFE53935);
-        background.setShape(GradientDrawable.OVAL);
-        close.setBackground(background);
-
-        int size = dp(52);
-        WindowManager.LayoutParams params = new WindowManager.LayoutParams(
-                size,
-                size,
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-                PixelFormat.TRANSLUCENT
-        );
-        params.gravity = Gravity.TOP | Gravity.END;
-        params.x = dp(24);
-        params.y = dp(252);
-
-        close.setOnClickListener(v -> closeOverlayCompletely());
-        closeButton = close;
-        windowManager.addView(closeButton, params);
-    }
-
-    private void showCloseControl() {
-        if (closeButton == null) return;
-        closeButton.setVisibility(View.VISIBLE);
-        closeButton.bringToFront();
+    private void armCloseButton() {
+        closeArmed = true;
+        if (floatingButton != null) {
+            floatingButton.setText("✕");
+            floatingButton.setTextSize(28f);
+            floatingButton.setBackground(closeButtonBackground);
+        }
         if (statusView != null) statusView.setText("לחצי על ✕ כדי לסגור את Live Translate");
     }
 
-    private void hideCloseControl() {
-        if (closeButton != null) closeButton.setVisibility(View.GONE);
+    private void disarmCloseButton() {
+        closeArmed = false;
+        if (floatingButton != null) {
+            floatingButton.setText(captureActive ? "■" : "🌐");
+            floatingButton.setTextSize(24f);
+            floatingButton.setBackground(normalButtonBackground);
+        }
     }
 
-    private void updateCloseButtonPosition(WindowManager.LayoutParams floatingParams) {
-        if (closeButton == null) return;
-        try {
-            WindowManager.LayoutParams closeParams = (WindowManager.LayoutParams) closeButton.getLayoutParams();
-            closeParams.x = floatingParams.x + dp(6);
-            closeParams.y = floatingParams.y + dp(76);
-            windowManager.updateViewLayout(closeButton, closeParams);
-        } catch (Exception ignored) {}
+    private void toggleCapture() {
+        disarmCloseButton();
+        Intent toggleIntent = new Intent(OverlayService.this, AudioCaptureService.class);
+        toggleIntent.setAction(AudioCaptureService.ACTION_TOGGLE);
+        try { startService(toggleIntent); } catch (Exception ignored) {}
     }
 
     private void closeOverlayCompletely() {
@@ -409,21 +478,21 @@ public class OverlayService extends Service {
             captureActive = true;
             StringBuilder meter = new StringBuilder();
             for (int i = 0; i < 5; i++) meter.append(i < level ? "●" : "○");
-            statusView.setText("🎧 קולט שמע • 🎤 מזהה מילים  " + meter);
-            if (floatingButton instanceof TextView) ((TextView) floatingButton).setText("■");
+            if (!closeArmed) statusView.setText("🎧 קולט שמע • 🎤 מזהה מילים  " + meter);
+            if (floatingButton != null && !closeArmed) floatingButton.setText("■");
             startSpeechRecognitionIfNeeded();
         } else if ("paused".equals(status)) {
             captureActive = false;
             stopSpeechRecognition();
-            statusView.setText("⏸ התרגום מושהה • לחצי 🌐 להמשך");
+            if (!closeArmed) statusView.setText("⏸ התרגום מושהה • לחצי 🌐 להמשך");
             hideSubtitle();
-            if (floatingButton instanceof TextView) ((TextView) floatingButton).setText("🌐");
+            if (floatingButton != null && !closeArmed) floatingButton.setText("🌐");
         } else if ("stopped".equals(status)) {
             captureActive = false;
             stopSpeechRecognition();
-            statusView.setText("Live Translate • הקליטה נעצרה");
+            if (!closeArmed) statusView.setText("Live Translate • הקליטה נעצרה");
             hideSubtitle();
-            if (floatingButton instanceof TextView) ((TextView) floatingButton).setText("🌐");
+            if (floatingButton != null && !closeArmed) floatingButton.setText("🌐");
         } else if ("unsupported".equals(status)) {
             captureActive = false;
             stopSpeechRecognition();
@@ -453,19 +522,26 @@ public class OverlayService extends Service {
     @Override
     public void onDestroy() {
         captureActive = false;
+        translationRequestId++;
         handler.removeCallbacksAndMessages(null);
         stopSpeechRecognition();
+
         if (speechRecognizer != null) {
             try { speechRecognizer.destroy(); } catch (Exception ignored) {}
             speechRecognizer = null;
         }
+        if (languageIdentifier != null) {
+            try { languageIdentifier.close(); } catch (Exception ignored) {}
+            languageIdentifier = null;
+        }
+        for (Translator translator : translators.values()) {
+            try { translator.close(); } catch (Exception ignored) {}
+        }
+        translators.clear();
+
         if (floatingButton != null && windowManager != null) {
             windowManager.removeView(floatingButton);
             floatingButton = null;
-        }
-        if (closeButton != null && windowManager != null) {
-            windowManager.removeView(closeButton);
-            closeButton = null;
         }
         if (subtitleView != null && windowManager != null) {
             windowManager.removeView(subtitleView);
