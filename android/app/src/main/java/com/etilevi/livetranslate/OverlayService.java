@@ -57,6 +57,7 @@ public class OverlayService extends Service {
     private LanguageIdentifier languageIdentifier;
     private final Map<String, Translator> translators = new HashMap<>();
     private long translationRequestId = 0L;
+    private String translationStatus = "";
 
     private final BroadcastReceiver captureStatusReceiver = new BroadcastReceiver() {
         @Override
@@ -131,11 +132,15 @@ public class OverlayService extends Service {
             @Override
             public void onResults(Bundle results) {
                 speechListening = false;
-                showBestResult(results);
+                translateFinalResult(results);
                 if (captureActive) scheduleSpeechRestart(350L);
             }
 
-            @Override public void onPartialResults(Bundle partialResults) { showBestResult(partialResults); }
+            @Override
+            public void onPartialResults(Bundle partialResults) {
+                showPartialResult(partialResults);
+            }
+
             @Override public void onEvent(int eventType, Bundle params) { }
 
             @Override
@@ -183,51 +188,83 @@ public class OverlayService extends Service {
         }
     }
 
-    private void showBestResult(Bundle results) {
-        if (results == null) return;
+    private String bestText(Bundle results) {
+        if (results == null) return null;
         ArrayList<String> matches = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
-        if (matches == null || matches.isEmpty()) return;
+        if (matches == null || matches.isEmpty()) return null;
         String text = matches.get(0);
-        if (text == null || text.trim().isEmpty()) return;
-        translateToHebrew(text.trim());
+        if (text == null || text.trim().isEmpty()) return null;
+        return text.trim();
+    }
+
+    private void showPartialResult(Bundle results) {
+        String text = bestText(results);
+        if (text == null) return;
+        if (translationStatus.isEmpty()) {
+            showSubtitleMessage(text);
+        }
+    }
+
+    private void translateFinalResult(Bundle results) {
+        String text = bestText(results);
+        if (text == null) return;
+        translateToHebrew(text);
     }
 
     private void translateToHebrew(String text) {
-        if (subtitleView == null || text == null || text.isEmpty()) return;
+        if (subtitleView == null || text == null || text.isEmpty() || languageIdentifier == null) return;
+
         final long requestId = ++translationRequestId;
-
-        String speechLanguage = normalizeLanguageTag(detectedLanguage);
-        String mlKitLanguage = speechLanguage == null ? null : TranslateLanguage.fromLanguageTag(speechLanguage);
-
-        if (mlKitLanguage != null) {
-            translateWithLanguage(text, mlKitLanguage, requestId);
-            return;
-        }
+        translationStatus = "🌐 מזהה שפה";
+        showSubtitleMessage("מזהה שפה…");
+        refreshCapturingStatus();
 
         languageIdentifier.identifyLanguage(text)
                 .addOnSuccessListener(languageCode -> {
                     if (requestId != translationRequestId) return;
-                    if (languageCode == null || "und".equals(languageCode)) {
-                        showSubtitleMessage("לא הצלחתי לזהות את שפת הדיבור: " + text);
-                        return;
+
+                    String sourceLanguage = null;
+                    if (languageCode != null && !"und".equals(languageCode)) {
+                        sourceLanguage = TranslateLanguage.fromLanguageTag(languageCode);
                     }
-                    String sourceLanguage = TranslateLanguage.fromLanguageTag(languageCode);
+
                     if (sourceLanguage == null) {
-                        showSubtitleMessage("השפה שזוהתה עדיין לא נתמכת בתרגום: " + text);
+                        String speechLanguage = normalizeLanguageTag(detectedLanguage);
+                        if (speechLanguage != null) {
+                            sourceLanguage = TranslateLanguage.fromLanguageTag(speechLanguage);
+                        }
+                    }
+
+                    if (sourceLanguage == null) {
+                        translationStatus = "🌐 שפה לא זוהתה";
+                        showSubtitleMessage("לא הצלחתי לזהות את שפת הדיבור: " + text);
+                        refreshCapturingStatus();
                         return;
                     }
+
                     translateWithLanguage(text, sourceLanguage, requestId);
                 })
                 .addOnFailureListener(e -> {
-                    if (requestId == translationRequestId) {
+                    if (requestId != translationRequestId) return;
+                    String speechLanguage = normalizeLanguageTag(detectedLanguage);
+                    String sourceLanguage = speechLanguage == null ? null : TranslateLanguage.fromLanguageTag(speechLanguage);
+                    if (sourceLanguage != null) {
+                        translateWithLanguage(text, sourceLanguage, requestId);
+                    } else {
+                        translationStatus = "🌐 שגיאת זיהוי שפה";
                         showSubtitleMessage("לא הצלחתי לזהות את שפת הדיבור: " + text);
+                        refreshCapturingStatus();
                     }
                 });
     }
 
     private void translateWithLanguage(String text, String sourceLanguage, long requestId) {
         if (TranslateLanguage.HEBREW.equals(sourceLanguage)) {
-            if (requestId == translationRequestId) showSubtitleMessage(text);
+            if (requestId == translationRequestId) {
+                translationStatus = "🌐 עברית";
+                showSubtitleMessage(text);
+                refreshCapturingStatus();
+            }
             return;
         }
 
@@ -242,30 +279,37 @@ public class OverlayService extends Service {
         }
 
         final Translator finalTranslator = translator;
-        if (requestId == translationRequestId) {
-            showSubtitleMessage("מתרגם לעברית…");
-            if (statusView != null) statusView.setText("🎧 קולט שמע • 🎤 מזהה מילים • 🌐 מתרגם לעברית");
-        }
+        translationStatus = "🌐 מכין תרגום";
+        showSubtitleMessage("מכין תרגום לעברית…");
+        refreshCapturingStatus();
 
         DownloadConditions conditions = new DownloadConditions.Builder().build();
         finalTranslator.downloadModelIfNeeded(conditions)
-                .addOnSuccessListener(unused -> finalTranslator.translate(text)
-                        .addOnSuccessListener(translatedText -> {
-                            if (requestId != translationRequestId) return;
-                            showSubtitleMessage(translatedText);
-                            if (statusView != null && captureActive) {
-                                statusView.setText("🎧 קולט שמע • 🎤 מזהה מילים • 🌐 עברית");
-                            }
-                        })
-                        .addOnFailureListener(e -> {
-                            if (requestId == translationRequestId) {
+                .addOnSuccessListener(unused -> {
+                    if (requestId != translationRequestId) return;
+                    translationStatus = "🌐 מתרגם";
+                    showSubtitleMessage("מתרגם לעברית…");
+                    refreshCapturingStatus();
+
+                    finalTranslator.translate(text)
+                            .addOnSuccessListener(translatedText -> {
+                                if (requestId != translationRequestId) return;
+                                translationStatus = "🌐 עברית";
+                                showSubtitleMessage(translatedText);
+                                refreshCapturingStatus();
+                            })
+                            .addOnFailureListener(e -> {
+                                if (requestId != translationRequestId) return;
+                                translationStatus = "🌐 שגיאת תרגום";
                                 showSubtitleMessage("שגיאה בתרגום. הטקסט שזוהה: " + text);
-                            }
-                        }))
+                                refreshCapturingStatus();
+                            });
+                })
                 .addOnFailureListener(e -> {
-                    if (requestId == translationRequestId) {
-                        showSubtitleMessage("מוריד מודל תרגום… נדרש חיבור לאינטרנט בפעם הראשונה");
-                    }
+                    if (requestId != translationRequestId) return;
+                    translationStatus = "🌐 הורדת מודל נכשלה";
+                    showSubtitleMessage("לא הצלחתי להוריד את מודל התרגום. ודאי שיש אינטרנט ונסי שוב.");
+                    refreshCapturingStatus();
                 });
     }
 
@@ -471,40 +515,49 @@ public class OverlayService extends Service {
         windowManager.addView(statusView, params);
     }
 
+    private void refreshCapturingStatus() {
+        if (statusView == null || !captureActive || closeArmed) return;
+        String suffix = translationStatus.isEmpty() ? "" : " • " + translationStatus;
+        statusView.setText("🎧 קולט שמע • 🎤 מזהה מילים" + suffix);
+    }
+
     private void updateCaptureStatus(String status, int level) {
         if (statusView == null) return;
 
         if ("capturing".equals(status)) {
             captureActive = true;
-            StringBuilder meter = new StringBuilder();
-            for (int i = 0; i < 5; i++) meter.append(i < level ? "●" : "○");
-            if (!closeArmed) statusView.setText("🎧 קולט שמע • 🎤 מזהה מילים  " + meter);
+            if (!closeArmed) refreshCapturingStatus();
             if (floatingButton != null && !closeArmed) floatingButton.setText("■");
             startSpeechRecognitionIfNeeded();
         } else if ("paused".equals(status)) {
             captureActive = false;
+            translationStatus = "";
             stopSpeechRecognition();
             if (!closeArmed) statusView.setText("⏸ התרגום מושהה • לחצי 🌐 להמשך");
             hideSubtitle();
             if (floatingButton != null && !closeArmed) floatingButton.setText("🌐");
         } else if ("stopped".equals(status)) {
             captureActive = false;
+            translationStatus = "";
             stopSpeechRecognition();
             if (!closeArmed) statusView.setText("Live Translate • הקליטה נעצרה");
             hideSubtitle();
             if (floatingButton != null && !closeArmed) floatingButton.setText("🌐");
         } else if ("unsupported".equals(status)) {
             captureActive = false;
+            translationStatus = "";
             stopSpeechRecognition();
             statusView.setText("המכשיר לא תומך בקליטת שמע פנימי");
             hideSubtitle();
         } else if ("capture_error".equals(status)) {
             captureActive = false;
+            translationStatus = "";
             stopSpeechRecognition();
             statusView.setText("לא הצלחנו לקלוט את השמע מהסרטון");
             hideSubtitle();
         } else if ("permission_error".equals(status)) {
             captureActive = false;
+            translationStatus = "";
             stopSpeechRecognition();
             statusView.setText("נדרש אישור Android לקליטת המדיה");
             hideSubtitle();
