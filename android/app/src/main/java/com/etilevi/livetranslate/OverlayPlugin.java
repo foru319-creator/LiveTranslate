@@ -1,13 +1,19 @@
 package com.etilevi.livetranslate;
 
+import android.app.Activity;
+import android.content.Context;
 import android.content.Intent;
+import android.media.projection.MediaProjectionManager;
 import android.net.Uri;
 import android.provider.Settings;
+
+import androidx.activity.result.ActivityResult;
 
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
+import com.getcapacitor.annotation.ActivityCallback;
 import com.getcapacitor.annotation.CapacitorPlugin;
 
 @CapacitorPlugin(name = "Overlay")
@@ -53,8 +59,39 @@ public class OverlayPlugin extends Plugin {
 
     @PluginMethod
     public void stop(PluginCall call) {
-        Intent intent = new Intent(getContext(), OverlayService.class);
-        getContext().stopService(intent);
+        Intent captureIntent = new Intent(getContext(), AudioCaptureService.class);
+        captureIntent.setAction(AudioCaptureService.ACTION_STOP);
+        getContext().startService(captureIntent);
+
+        Intent overlayIntent = new Intent(getContext(), OverlayService.class);
+        getContext().stopService(overlayIntent);
         call.resolve();
+    }
+
+    @PluginMethod
+    public void startAudioCapture(PluginCall call) {
+        MediaProjectionManager manager = (MediaProjectionManager) getContext()
+                .getSystemService(Context.MEDIA_PROJECTION_SERVICE);
+        Intent permissionIntent = manager.createScreenCaptureIntent();
+        startActivityForResult(call, permissionIntent, "capturePermissionResult");
+    }
+
+    @ActivityCallback
+    private void capturePermissionResult(PluginCall call, ActivityResult result) {
+        if (call == null) return;
+
+        if (result.getResultCode() != Activity.RESULT_OK || result.getData() == null) {
+            call.reject("Media capture permission was not granted");
+            return;
+        }
+
+        Intent serviceIntent = new Intent(getContext(), AudioCaptureService.class);
+        serviceIntent.putExtra(AudioCaptureService.EXTRA_RESULT_CODE, result.getResultCode());
+        serviceIntent.putExtra(AudioCaptureService.EXTRA_RESULT_DATA, result.getData());
+        getContext().startForegroundService(serviceIntent);
+
+        JSObject response = new JSObject();
+        response.put("started", true);
+        call.resolve(response);
     }
 }
