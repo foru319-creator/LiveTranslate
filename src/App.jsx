@@ -32,7 +32,7 @@ function App() {
       if (!isAndroid) return
       try {
         const { granted } = await Overlay.hasPermission()
-        if (granted) setStatusMessage('מוכן להפעלה')
+        if (granted && !isActive) setStatusMessage('מוכן להפעלה')
       } catch {
         // Native plugin may not be available while previewing in a browser.
       }
@@ -41,7 +41,7 @@ function App() {
     refreshPermission()
     document.addEventListener('visibilitychange', refreshPermission)
     return () => document.removeEventListener('visibilitychange', refreshPermission)
-  }, [isAndroid])
+  }, [isAndroid, isActive])
 
   const handleToggle = async () => {
     if (!isAndroid) {
@@ -64,12 +64,15 @@ function App() {
         return
       }
 
+      setStatusMessage('ממתין לאישור Android לקליטת שמע…')
       await Overlay.start()
+      await Overlay.startAudioCapture()
       setIsActive(true)
-      setStatusMessage('הכפתור הצף פעיל')
+      setStatusMessage('קליטת השמע פעילה')
     } catch (error) {
       console.error(error)
-      setStatusMessage('לא הצלחנו להפעיל את הכפתור הצף')
+      setIsActive(false)
+      setStatusMessage('האישור בוטל או שלא הצלחנו להתחיל קליטת שמע')
     }
   }
 
@@ -117,7 +120,7 @@ function App() {
           onClick={handleToggle}
         >
           <span className="button-dot" />
-          {isActive ? 'עצור כפתור צף' : 'הפעל כפתור צף'}
+          {isActive ? 'עצור תרגום' : 'הפעל תרגום'}
         </button>
 
         <div className={`status-box ${isActive ? 'active' : ''}`}>
@@ -126,19 +129,19 @@ function App() {
             <strong>{statusMessage}</strong>
             <small>
               {isActive
-                ? `עברי לאינסטגרם, פייסבוק או לדפדפן. היעד שנבחר: ${targetLanguage}`
-                : 'בהפעלה הראשונה Android יבקש הרשאה להצגת הכפתור מעל אפליקציות אחרות'}
+                ? `עברי לסרטון. כרגע אנחנו בודקים קליטת שמע פנימי; שפת היעד: ${targetLanguage}`
+                : 'Android יבקש אישור לשיתוף/הקלטת המדיה בכל הפעלת תרגום חדשה'}
             </small>
           </div>
         </div>
       </section>
 
       <section className="how-it-works">
-        <h2>בדיקת הכפתור הצף</h2>
+        <h2>שלב בדיקת השמע</h2>
         <div className="steps">
-          <div className="step"><span>1</span><p>הפעילי את הכפתור</p></div>
-          <div className="step"><span>2</span><p>אשרי הצגה מעל אפליקציות</p></div>
-          <div className="step"><span>3</span><p>צאי מהאפליקציה וגררי את 🌐 על המסך</p></div>
+          <div className="step"><span>1</span><p>לחצי הפעל תרגום ואשרי את חלון Android</p></div>
+          <div className="step"><span>2</span><p>פתחי סרטון עם קול באינסטגרם, פייסבוק או בדפדפן</p></div>
+          <div className="step"><span>3</span><p>המחוון הצף יציג אם האפליקציה באמת קולטת את השמע</p></div>
         </div>
       </section>
     </main>
