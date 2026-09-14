@@ -1,5 +1,8 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import { Capacitor, registerPlugin } from '@capacitor/core'
 import './App.css'
+
+const Overlay = registerPlugin('Overlay')
 
 const languages = [
   'עברית',
@@ -20,6 +23,55 @@ const languages = [
 function App() {
   const [targetLanguage, setTargetLanguage] = useState('עברית')
   const [isActive, setIsActive] = useState(false)
+  const [statusMessage, setStatusMessage] = useState('מוכן להפעלה')
+
+  const isAndroid = Capacitor.getPlatform() === 'android'
+
+  useEffect(() => {
+    const refreshPermission = async () => {
+      if (!isAndroid) return
+      try {
+        const { granted } = await Overlay.hasPermission()
+        if (granted) setStatusMessage('מוכן להפעלה')
+      } catch {
+        // Native plugin may not be available while previewing in a browser.
+      }
+    }
+
+    refreshPermission()
+    document.addEventListener('visibilitychange', refreshPermission)
+    return () => document.removeEventListener('visibilitychange', refreshPermission)
+  }, [isAndroid])
+
+  const handleToggle = async () => {
+    if (!isAndroid) {
+      setIsActive((current) => !current)
+      return
+    }
+
+    try {
+      if (isActive) {
+        await Overlay.stop()
+        setIsActive(false)
+        setStatusMessage('מוכן להפעלה')
+        return
+      }
+
+      const { granted } = await Overlay.hasPermission()
+      if (!granted) {
+        setStatusMessage('יש לאשר הצגה מעל אפליקציות אחרות')
+        await Overlay.requestPermission()
+        return
+      }
+
+      await Overlay.start()
+      setIsActive(true)
+      setStatusMessage('הכפתור הצף פעיל')
+    } catch (error) {
+      console.error(error)
+      setStatusMessage('לא הצלחנו להפעיל את הכפתור הצף')
+    }
+  }
 
   return (
     <main className="app-shell" dir="rtl">
@@ -62,31 +114,31 @@ function App() {
         <button
           type="button"
           className={`primary-button ${isActive ? 'active' : ''}`}
-          onClick={() => setIsActive((current) => !current)}
+          onClick={handleToggle}
         >
           <span className="button-dot" />
-          {isActive ? 'עצור תרגום' : 'הפעל תרגום'}
+          {isActive ? 'עצור כפתור צף' : 'הפעל כפתור צף'}
         </button>
 
         <div className={`status-box ${isActive ? 'active' : ''}`}>
           <span className="status-icon">{isActive ? '●' : '○'}</span>
           <div>
-            <strong>{isActive ? 'התרגום פעיל' : 'מוכן להפעלה'}</strong>
+            <strong>{statusMessage}</strong>
             <small>
               {isActive
-                ? `כתוביות יתורגמו ל־${targetLanguage}`
-                : 'בהמשך הכפתור הצף יעבוד מעל Instagram, Facebook והדפדפן'}
+                ? `עברי לאינסטגרם, פייסבוק או לדפדפן. היעד שנבחר: ${targetLanguage}`
+                : 'בהפעלה הראשונה Android יבקש הרשאה להצגת הכפתור מעל אפליקציות אחרות'}
             </small>
           </div>
         </div>
       </section>
 
       <section className="how-it-works">
-        <h2>איך זה יעבוד?</h2>
+        <h2>בדיקת הכפתור הצף</h2>
         <div className="steps">
-          <div className="step"><span>1</span><p>פותחים סרטון</p></div>
-          <div className="step"><span>2</span><p>לוחצים על הכפתור הצף</p></div>
-          <div className="step"><span>3</span><p>מקבלים כתוביות מתורגמות</p></div>
+          <div className="step"><span>1</span><p>הפעילי את הכפתור</p></div>
+          <div className="step"><span>2</span><p>אשרי הצגה מעל אפליקציות</p></div>
+          <div className="step"><span>3</span><p>צאי מהאפליקציה וגררי את 🌐 על המסך</p></div>
         </div>
       </section>
     </main>
