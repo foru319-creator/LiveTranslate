@@ -89,10 +89,7 @@ public class OverlayService extends Service {
 
         speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
         speechRecognizer.setRecognitionListener(new RecognitionListener() {
-            @Override public void onReadyForSpeech(Bundle params) {
-                speechListening = true;
-            }
-
+            @Override public void onReadyForSpeech(Bundle params) { speechListening = true; }
             @Override public void onBeginningOfSpeech() { }
             @Override public void onRmsChanged(float rmsdB) { }
             @Override public void onBufferReceived(byte[] buffer) { }
@@ -125,20 +122,14 @@ public class OverlayService extends Service {
                 if (captureActive) scheduleSpeechRestart(350L);
             }
 
-            @Override
-            public void onPartialResults(Bundle partialResults) {
-                showBestResult(partialResults);
-            }
-
+            @Override public void onPartialResults(Bundle partialResults) { showBestResult(partialResults); }
             @Override public void onEvent(int eventType, Bundle params) { }
 
             @Override
             public void onLanguageDetection(Bundle results) {
                 if (Build.VERSION.SDK_INT >= 34 && results != null) {
                     String language = results.getString(SpeechRecognizer.DETECTED_LANGUAGE);
-                    if (language != null && !language.isEmpty()) {
-                        detectedLanguage = language;
-                    }
+                    if (language != null && !language.isEmpty()) detectedLanguage = language;
                 }
             }
         });
@@ -218,7 +209,6 @@ public class OverlayService extends Service {
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
                 PixelFormat.TRANSLUCENT
         );
-
         params.gravity = Gravity.TOP | Gravity.END;
         params.x = dp(18);
         params.y = dp(180);
@@ -231,6 +221,7 @@ public class OverlayService extends Service {
             private boolean moved;
             private boolean longPressed;
             private Runnable longPressRunnable;
+            private final int moveTolerance = dp(24);
 
             @Override
             public boolean onTouch(View view, MotionEvent event) {
@@ -248,31 +239,40 @@ public class OverlayService extends Service {
                                 showCloseControl();
                             }
                         };
-                        handler.postDelayed(longPressRunnable, 650L);
+                        handler.postDelayed(longPressRunnable, 500L);
                         return true;
 
                     case MotionEvent.ACTION_MOVE:
                         float dx = event.getRawX() - initialTouchX;
                         float dy = event.getRawY() - initialTouchY;
-                        if (Math.abs(dx) > 8 || Math.abs(dy) > 8) {
+                        if (!longPressed && (Math.abs(dx) > moveTolerance || Math.abs(dy) > moveTolerance)) {
                             moved = true;
                             if (longPressRunnable != null) handler.removeCallbacks(longPressRunnable);
                         }
-                        params.x = initialX - (int) dx;
-                        params.y = initialY + (int) dy;
-                        windowManager.updateViewLayout(floatingButton, params);
-                        updateCloseButtonPosition(params);
+                        if (!longPressed) {
+                            params.x = initialX - (int) dx;
+                            params.y = initialY + (int) dy;
+                            windowManager.updateViewLayout(floatingButton, params);
+                            updateCloseButtonPosition(params);
+                        }
                         return true;
 
                     case MotionEvent.ACTION_UP:
-                    case MotionEvent.ACTION_CANCEL:
                         if (longPressRunnable != null) handler.removeCallbacks(longPressRunnable);
-                        if (event.getAction() == MotionEvent.ACTION_UP && !moved && !longPressed) {
+                        if (longPressed) {
+                            showCloseControl();
+                            return true;
+                        }
+                        if (!moved) {
                             hideCloseControl();
                             Intent toggleIntent = new Intent(OverlayService.this, AudioCaptureService.class);
                             toggleIntent.setAction(AudioCaptureService.ACTION_TOGGLE);
                             startService(toggleIntent);
                         }
+                        return true;
+
+                    case MotionEvent.ACTION_CANCEL:
+                        if (longPressRunnable != null) handler.removeCallbacks(longPressRunnable);
                         return true;
                 }
                 return false;
@@ -289,7 +289,7 @@ public class OverlayService extends Service {
         close.setTextColor(Color.WHITE);
         close.setTextSize(22f);
         close.setGravity(Gravity.CENTER);
-        close.setElevation(14f);
+        close.setElevation(50f);
         close.setVisibility(View.GONE);
 
         GradientDrawable background = new GradientDrawable();
@@ -297,7 +297,7 @@ public class OverlayService extends Service {
         background.setShape(GradientDrawable.OVAL);
         close.setBackground(background);
 
-        int size = dp(48);
+        int size = dp(52);
         WindowManager.LayoutParams params = new WindowManager.LayoutParams(
                 size,
                 size,
@@ -306,11 +306,10 @@ public class OverlayService extends Service {
                 PixelFormat.TRANSLUCENT
         );
         params.gravity = Gravity.TOP | Gravity.END;
-        params.x = dp(26);
+        params.x = dp(24);
         params.y = dp(252);
 
         close.setOnClickListener(v -> closeOverlayCompletely());
-
         closeButton = close;
         windowManager.addView(closeButton, params);
     }
@@ -318,6 +317,7 @@ public class OverlayService extends Service {
     private void showCloseControl() {
         if (closeButton == null) return;
         closeButton.setVisibility(View.VISIBLE);
+        closeButton.bringToFront();
         if (statusView != null) statusView.setText("לחצי על ✕ כדי לסגור את Live Translate");
     }
 
@@ -329,8 +329,8 @@ public class OverlayService extends Service {
         if (closeButton == null) return;
         try {
             WindowManager.LayoutParams closeParams = (WindowManager.LayoutParams) closeButton.getLayoutParams();
-            closeParams.x = floatingParams.x + dp(8);
-            closeParams.y = floatingParams.y + dp(72);
+            closeParams.x = floatingParams.x + dp(6);
+            closeParams.y = floatingParams.y + dp(76);
             windowManager.updateViewLayout(closeButton, closeParams);
         } catch (Exception ignored) {}
     }
