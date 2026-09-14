@@ -9,7 +9,9 @@ import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.SystemClock;
 import android.view.Gravity;
 import android.view.MotionEvent;
@@ -20,11 +22,13 @@ import android.widget.TextView;
 public class OverlayService extends Service {
     private WindowManager windowManager;
     private View floatingButton;
+    private TextView closeButton;
     private TextView statusView;
     private TextView subtitleView;
     private boolean receiverRegistered = false;
     private long lastSubtitleChange = 0L;
     private int subtitleIndex = 0;
+    private final Handler handler = new Handler(Looper.getMainLooper());
 
     private final String[] mockSubtitles = new String[] {
             "בדיקת כתוביות: השמע נקלט בהצלחה",
@@ -49,6 +53,7 @@ public class OverlayService extends Service {
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
         registerCaptureReceiver();
         showFloatingButton();
+        showCloseButton();
         showSubtitleView();
         showStatusView();
     }
@@ -94,6 +99,8 @@ public class OverlayService extends Service {
             private float initialTouchX;
             private float initialTouchY;
             private boolean moved;
+            private boolean longPressed;
+            private Runnable longPressRunnable;
 
             @Override
             public boolean onTouch(View view, MotionEvent event) {
@@ -104,17 +111,34 @@ public class OverlayService extends Service {
                         initialTouchX = event.getRawX();
                         initialTouchY = event.getRawY();
                         moved = false;
+                        longPressed = false;
+                        longPressRunnable = () -> {
+                            if (!moved) {
+                                longPressed = true;
+                                showCloseControl();
+                            }
+                        };
+                        handler.postDelayed(longPressRunnable, 650L);
                         return true;
+
                     case MotionEvent.ACTION_MOVE:
                         float dx = event.getRawX() - initialTouchX;
                         float dy = event.getRawY() - initialTouchY;
-                        if (Math.abs(dx) > 8 || Math.abs(dy) > 8) moved = true;
+                        if (Math.abs(dx) > 8 || Math.abs(dy) > 8) {
+                            moved = true;
+                            if (longPressRunnable != null) handler.removeCallbacks(longPressRunnable);
+                        }
                         params.x = initialX - (int) dx;
                         params.y = initialY + (int) dy;
                         windowManager.updateViewLayout(floatingButton, params);
+                        updateCloseButtonPosition(params);
                         return true;
+
                     case MotionEvent.ACTION_UP:
-                        if (!moved) {
+                    case MotionEvent.ACTION_CANCEL:
+                        if (longPressRunnable != null) handler.removeCallbacks(longPressRunnable);
+                        if (event.getAction() == MotionEvent.ACTION_UP && !moved && !longPressed) {
+                            hideCloseControl();
                             Intent toggleIntent = new Intent(OverlayService.this, AudioCaptureService.class);
                             toggleIntent.setAction(AudioCaptureService.ACTION_TOGGLE);
                             startService(toggleIntent);
@@ -127,6 +151,65 @@ public class OverlayService extends Service {
 
         floatingButton = button;
         windowManager.addView(floatingButton, params);
+    }
+
+    private void showCloseButton() {
+        TextView close = new TextView(this);
+        close.setText("✕");
+        close.setTextColor(Color.WHITE);
+        close.setTextSize(22f);
+        close.setGravity(Gravity.CENTER);
+        close.setElevation(14f);
+        close.setVisibility(View.GONE);
+
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(0xFFE53935);
+        background.setShape(GradientDrawable.OVAL);
+        close.setBackground(background);
+
+        int size = dp(48);
+        WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                size,
+                size,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                PixelFormat.TRANSLUCENT
+        );
+        params.gravity = Gravity.TOP | Gravity.END;
+        params.x = dp(26);
+        params.y = dp(252);
+
+        close.setOnClickListener(v -> closeOverlayCompletely());
+
+        closeButton = close;
+        windowManager.addView(closeButton, params);
+    }
+
+    private void showCloseControl() {
+        if (closeButton == null) return;
+        closeButton.setVisibility(View.VISIBLE);
+        if (statusView != null) statusView.setText("לחצי על ✕ כדי לסגור את Live Translate");
+    }
+
+    private void hideCloseControl() {
+        if (closeButton != null) closeButton.setVisibility(View.GONE);
+    }
+
+    private void updateCloseButtonPosition(WindowManager.LayoutParams floatingParams) {
+        if (closeButton == null) return;
+        try {
+            WindowManager.LayoutParams closeParams = (WindowManager.LayoutParams) closeButton.getLayoutParams();
+            closeParams.x = floatingParams.x + dp(8);
+            closeParams.y = floatingParams.y + dp(72);
+            windowManager.updateViewLayout(closeButton, closeParams);
+        } catch (Exception ignored) {}
+    }
+
+    private void closeOverlayCompletely() {
+        Intent stopCapture = new Intent(this, AudioCaptureService.class);
+        stopCapture.setAction(AudioCaptureService.ACTION_STOP);
+        try { startService(stopCapture); } catch (Exception ignored) {}
+        stopSelf();
     }
 
     private void showSubtitleView() {
@@ -238,9 +321,14 @@ public class OverlayService extends Service {
 
     @Override
     public void onDestroy() {
+        handler.removeCallbacksAndMessages(null);
         if (floatingButton != null && windowManager != null) {
             windowManager.removeView(floatingButton);
             floatingButton = null;
+        }
+        if (closeButton != null && windowManager != null) {
+            windowManager.removeView(closeButton);
+            closeButton = null;
         }
         if (subtitleView != null && windowManager != null) {
             windowManager.removeView(subtitleView);
