@@ -1,23 +1,30 @@
 package com.etilevi.livetranslate;
 
+import android.Manifest;
 import android.app.Service;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
-import android.os.SystemClock;
+import android.speech.RecognitionListener;
+import android.speech.RecognizerIntent;
+import android.speech.SpeechRecognizer;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.TextView;
+
+import java.util.ArrayList;
 
 public class OverlayService extends Service {
     private WindowManager windowManager;
@@ -26,16 +33,13 @@ public class OverlayService extends Service {
     private TextView statusView;
     private TextView subtitleView;
     private boolean receiverRegistered = false;
-    private long lastSubtitleChange = 0L;
-    private int subtitleIndex = 0;
     private final Handler handler = new Handler(Looper.getMainLooper());
 
-    private final String[] mockSubtitles = new String[] {
-            "בדיקת כתוביות: השמע נקלט בהצלחה",
-            "כאן יופיע התרגום של המשפט שנאמר בסרטון",
-            "הכתוביות יוצגו מעל כל אפליקציה בזמן אמת",
-            "השלב הבא יהיה לחבר זיהוי דיבור ותרגום אמיתי"
-    };
+    private SpeechRecognizer speechRecognizer;
+    private Intent speechIntent;
+    private boolean speechListening = false;
+    private boolean captureActive = false;
+    private String detectedLanguage = "";
 
     private final BroadcastReceiver captureStatusReceiver = new BroadcastReceiver() {
         @Override
@@ -56,6 +60,7 @@ public class OverlayService extends Service {
         showCloseButton();
         showSubtitleView();
         showStatusView();
+        setupSpeechRecognizer();
     }
 
     private void registerCaptureReceiver() {
@@ -66,6 +71,131 @@ public class OverlayService extends Service {
             registerReceiver(captureStatusReceiver, filter);
         }
         receiverRegistered = true;
+    }
+
+    private void setupSpeechRecognizer() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
+
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            if (subtitleView != null) {
+                subtitleView.setText("זיהוי הדיבור של Android אינו זמין במכשיר");
+                subtitleView.setVisibility(View.VISIBLE);
+            }
+            return;
+        }
+
+        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
+        speechRecognizer.setRecognitionListener(new RecognitionListener() {
+            @Override public void onReadyForSpeech(Bundle params) {
+                speechListening = true;
+            }
+
+            @Override public void onBeginningOfSpeech() { }
+            @Override public void onRmsChanged(float rmsdB) { }
+            @Override public void onBufferReceived(byte[] buffer) { }
+            @Override public void onEndOfSpeech() { }
+
+            @Override
+            public void onError(int error) {
+                speechListening = false;
+                if (!captureActive) return;
+
+                if (error == SpeechRecognizer.ERROR_NO_MATCH ||
+                        error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
+                    scheduleSpeechRestart(500L);
+                } else if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) {
+                    scheduleSpeechRestart(900L);
+                } else if (error == SpeechRecognizer.ERROR_AUDIO) {
+                    showRecognizedText("זיהוי דיבור: לא התקבל קול מהמיקרופון");
+                    scheduleSpeechRestart(1200L);
+                } else if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
+                    showRecognizedText("נדרש אישור מיקרופון לזיהוי הדיבור");
+                } else {
+                    scheduleSpeechRestart(1000L);
+                }
+            }
+
+            @Override
+            public void onResults(Bundle results) {
+                speechListening = false;
+                showBestResult(results);
+                if (captureActive) scheduleSpeechRestart(350L);
+            }
+
+            @Override
+            public void onPartialResults(Bundle partialResults) {
+                showBestResult(partialResults);
+            }
+
+            @Override public void onEvent(int eventType, Bundle params) { }
+
+            @Override
+            public void onLanguageDetection(Bundle results) {
+                if (Build.VERSION.SDK_INT >= 34 && results != null) {
+                    String language = results.getString(SpeechRecognizer.DETECTED_LANGUAGE);
+                    if (language != null && !language.isEmpty()) {
+                        detectedLanguage = language;
+                    }
+                }
+            }
+        });
+
+        speechIntent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        speechIntent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        speechIntent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
+        speechIntent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3);
+        speechIntent.putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, getPackageName());
+
+        if (Build.VERSION.SDK_INT >= 34) {
+            speechIntent.putExtra(RecognizerIntent.EXTRA_ENABLE_LANGUAGE_DETECTION, true);
+            speechIntent.putExtra(RecognizerIntent.EXTRA_ENABLE_LANGUAGE_SWITCH, true);
+        }
+    }
+
+    private void startSpeechRecognitionIfNeeded() {
+        if (!captureActive || speechRecognizer == null || speechIntent == null || speechListening) return;
+        try {
+            speechListening = true;
+            speechRecognizer.startListening(speechIntent);
+        } catch (Exception e) {
+            speechListening = false;
+            showRecognizedText("לא הצלחנו להפעיל את זיהוי הדיבור");
+        }
+    }
+
+    private void scheduleSpeechRestart(long delayMs) {
+        handler.postDelayed(() -> {
+            if (captureActive) startSpeechRecognitionIfNeeded();
+        }, delayMs);
+    }
+
+    private void stopSpeechRecognition() {
+        speechListening = false;
+        if (speechRecognizer != null) {
+            try { speechRecognizer.cancel(); } catch (Exception ignored) {}
+        }
+    }
+
+    private void showBestResult(Bundle results) {
+        if (results == null) return;
+        ArrayList<String> matches = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+        if (matches == null || matches.isEmpty()) return;
+        String text = matches.get(0);
+        if (text == null || text.trim().isEmpty()) return;
+        showRecognizedText(text.trim());
+    }
+
+    private void showRecognizedText(String text) {
+        if (subtitleView == null) return;
+        if (detectedLanguage != null && !detectedLanguage.isEmpty()) {
+            subtitleView.setText("[" + detectedLanguage + "]  " + text);
+        } else {
+            subtitleView.setText(text);
+        }
+        subtitleView.setVisibility(View.VISIBLE);
     }
 
     private void showFloatingButton() {
@@ -206,6 +336,8 @@ public class OverlayService extends Service {
     }
 
     private void closeOverlayCompletely() {
+        captureActive = false;
+        stopSpeechRecognition();
         Intent stopCapture = new Intent(this, AudioCaptureService.class);
         stopCapture.setAction(AudioCaptureService.ACTION_STOP);
         try { startService(stopCapture); } catch (Exception ignored) {}
@@ -274,40 +406,39 @@ public class OverlayService extends Service {
         if (statusView == null) return;
 
         if ("capturing".equals(status)) {
+            captureActive = true;
             StringBuilder meter = new StringBuilder();
             for (int i = 0; i < 5; i++) meter.append(i < level ? "●" : "○");
-            statusView.setText("🎧 קולט שמע מהסרטון  " + meter);
+            statusView.setText("🎧 קולט שמע • 🎤 מזהה מילים  " + meter);
             if (floatingButton instanceof TextView) ((TextView) floatingButton).setText("■");
-            updateMockSubtitle(level);
+            startSpeechRecognitionIfNeeded();
         } else if ("paused".equals(status)) {
+            captureActive = false;
+            stopSpeechRecognition();
             statusView.setText("⏸ התרגום מושהה • לחצי 🌐 להמשך");
             hideSubtitle();
             if (floatingButton instanceof TextView) ((TextView) floatingButton).setText("🌐");
         } else if ("stopped".equals(status)) {
+            captureActive = false;
+            stopSpeechRecognition();
             statusView.setText("Live Translate • הקליטה נעצרה");
             hideSubtitle();
             if (floatingButton instanceof TextView) ((TextView) floatingButton).setText("🌐");
         } else if ("unsupported".equals(status)) {
+            captureActive = false;
+            stopSpeechRecognition();
             statusView.setText("המכשיר לא תומך בקליטת שמע פנימי");
             hideSubtitle();
         } else if ("capture_error".equals(status)) {
+            captureActive = false;
+            stopSpeechRecognition();
             statusView.setText("לא הצלחנו לקלוט את השמע מהסרטון");
             hideSubtitle();
         } else if ("permission_error".equals(status)) {
+            captureActive = false;
+            stopSpeechRecognition();
             statusView.setText("נדרש אישור Android לקליטת המדיה");
             hideSubtitle();
-        }
-    }
-
-    private void updateMockSubtitle(int level) {
-        if (subtitleView == null || level <= 0) return;
-
-        long now = SystemClock.elapsedRealtime();
-        if (subtitleView.getVisibility() != View.VISIBLE || now - lastSubtitleChange >= 2500L) {
-            subtitleView.setText(mockSubtitles[subtitleIndex]);
-            subtitleView.setVisibility(View.VISIBLE);
-            subtitleIndex = (subtitleIndex + 1) % mockSubtitles.length;
-            lastSubtitleChange = now;
         }
     }
 
@@ -321,7 +452,13 @@ public class OverlayService extends Service {
 
     @Override
     public void onDestroy() {
+        captureActive = false;
         handler.removeCallbacksAndMessages(null);
+        stopSpeechRecognition();
+        if (speechRecognizer != null) {
+            try { speechRecognizer.destroy(); } catch (Exception ignored) {}
+            speechRecognizer = null;
+        }
         if (floatingButton != null && windowManager != null) {
             windowManager.removeView(floatingButton);
             floatingButton = null;
