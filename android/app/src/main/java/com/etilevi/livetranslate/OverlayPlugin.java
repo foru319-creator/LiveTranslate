@@ -1,5 +1,6 @@
 package com.etilevi.livetranslate;
 
+import android.Manifest;
 import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
@@ -10,13 +11,21 @@ import android.provider.Settings;
 import androidx.activity.result.ActivityResult;
 
 import com.getcapacitor.JSObject;
+import com.getcapacitor.PermissionState;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.ActivityCallback;
 import com.getcapacitor.annotation.CapacitorPlugin;
+import com.getcapacitor.annotation.Permission;
+import com.getcapacitor.annotation.PermissionCallback;
 
-@CapacitorPlugin(name = "Overlay")
+@CapacitorPlugin(
+        name = "Overlay",
+        permissions = {
+                @Permission(alias = "microphone", strings = { Manifest.permission.RECORD_AUDIO })
+        }
+)
 public class OverlayPlugin extends Plugin {
 
     @PluginMethod
@@ -61,7 +70,7 @@ public class OverlayPlugin extends Plugin {
     public void stop(PluginCall call) {
         Intent captureIntent = new Intent(getContext(), AudioCaptureService.class);
         captureIntent.setAction(AudioCaptureService.ACTION_STOP);
-        getContext().startService(captureIntent);
+        try { getContext().startService(captureIntent); } catch (Exception ignored) {}
 
         Intent overlayIntent = new Intent(getContext(), OverlayService.class);
         getContext().stopService(overlayIntent);
@@ -70,6 +79,24 @@ public class OverlayPlugin extends Plugin {
 
     @PluginMethod
     public void startAudioCapture(PluginCall call) {
+        if (getPermissionState("microphone") != PermissionState.GRANTED) {
+            requestPermissionForAlias("microphone", call, "microphonePermissionCallback");
+            return;
+        }
+        launchMediaProjectionPermission(call);
+    }
+
+    @PermissionCallback
+    private void microphonePermissionCallback(PluginCall call) {
+        if (call == null) return;
+        if (getPermissionState("microphone") != PermissionState.GRANTED) {
+            call.reject("Microphone permission was not granted");
+            return;
+        }
+        launchMediaProjectionPermission(call);
+    }
+
+    private void launchMediaProjectionPermission(PluginCall call) {
         MediaProjectionManager manager = (MediaProjectionManager) getContext()
                 .getSystemService(Context.MEDIA_PROJECTION_SERVICE);
         Intent permissionIntent = manager.createScreenCaptureIntent();
