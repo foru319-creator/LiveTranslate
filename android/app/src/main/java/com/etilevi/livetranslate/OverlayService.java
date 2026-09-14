@@ -26,6 +26,7 @@ import android.widget.TextView;
 
 import com.google.mlkit.common.model.DownloadConditions;
 import com.google.mlkit.nl.languageid.LanguageIdentification;
+import com.google.mlkit.nl.languageid.LanguageIdentificationOptions;
 import com.google.mlkit.nl.languageid.LanguageIdentifier;
 import com.google.mlkit.nl.translate.TranslateLanguage;
 import com.google.mlkit.nl.translate.Translation;
@@ -73,7 +74,14 @@ public class OverlayService extends Service {
     public void onCreate() {
         super.onCreate();
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
-        languageIdentifier = LanguageIdentification.getClient();
+        // Recognized speech arrives in short snippets (a few words at a time), and ML Kit's
+        // default confidence threshold (0.5) is tuned for longer text — it almost always
+        // returns "und" (undetermined) for short phrases, which blocks translation entirely.
+        // Lowering the threshold lets short snippets resolve to a language reliably.
+        LanguageIdentificationOptions languageIdOptions = new LanguageIdentificationOptions.Builder()
+                .setConfidenceThreshold(0.2f)
+                .build();
+        languageIdentifier = LanguageIdentification.getClient(languageIdOptions);
         registerCaptureReceiver();
         showFloatingButton();
         showSubtitleView();
@@ -369,13 +377,16 @@ public class OverlayService extends Service {
             public boolean onTouch(View view, MotionEvent event) {
                 switch (event.getAction()) {
                     case MotionEvent.ACTION_DOWN:
+                        // Reset before the closeArmed early-return: otherwise a stale
+                        // longPressed=true from the gesture that armed the X survives into
+                        // the next tap and permanently blocks closeOverlayCompletely() below.
+                        longPressed = false;
                         if (closeArmed) return true;
                         initialX = params.x;
                         initialY = params.y;
                         initialTouchX = event.getRawX();
                         initialTouchY = event.getRawY();
                         moved = false;
-                        longPressed = false;
                         longPressRunnable = () -> {
                             if (!moved && !closeArmed) {
                                 longPressed = true;
