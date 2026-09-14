@@ -10,6 +10,7 @@ import android.graphics.PixelFormat;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.IBinder;
+import android.os.SystemClock;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
@@ -20,7 +21,17 @@ public class OverlayService extends Service {
     private WindowManager windowManager;
     private View floatingButton;
     private TextView statusView;
+    private TextView subtitleView;
     private boolean receiverRegistered = false;
+    private long lastSubtitleChange = 0L;
+    private int subtitleIndex = 0;
+
+    private final String[] mockSubtitles = new String[] {
+            "בדיקת כתוביות: השמע נקלט בהצלחה",
+            "כאן יופיע התרגום של המשפט שנאמר בסרטון",
+            "הכתוביות יוצגו מעל כל אפליקציה בזמן אמת",
+            "השלב הבא יהיה לחבר זיהוי דיבור ותרגום אמיתי"
+    };
 
     private final BroadcastReceiver captureStatusReceiver = new BroadcastReceiver() {
         @Override
@@ -38,6 +49,7 @@ public class OverlayService extends Service {
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
         registerCaptureReceiver();
         showFloatingButton();
+        showSubtitleView();
         showStatusView();
     }
 
@@ -117,6 +129,36 @@ public class OverlayService extends Service {
         windowManager.addView(floatingButton, params);
     }
 
+    private void showSubtitleView() {
+        TextView subtitle = new TextView(this);
+        subtitle.setTextColor(Color.WHITE);
+        subtitle.setTextSize(20f);
+        subtitle.setGravity(Gravity.CENTER);
+        subtitle.setPadding(dp(18), dp(12), dp(18), dp(12));
+        subtitle.setMaxLines(3);
+        subtitle.setVisibility(View.GONE);
+        subtitle.setElevation(11f);
+
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(0xCC000000);
+        background.setCornerRadius(dp(14));
+        subtitle.setBackground(background);
+
+        WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+                PixelFormat.TRANSLUCENT
+        );
+        params.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+        params.y = dp(145);
+        params.horizontalMargin = 0.05f;
+
+        subtitleView = subtitle;
+        windowManager.addView(subtitleView, params);
+    }
+
     private void showStatusView() {
         TextView status = new TextView(this);
         status.setText("Live Translate • ממתין לאישור קליטת שמע");
@@ -153,19 +195,41 @@ public class OverlayService extends Service {
             for (int i = 0; i < 5; i++) meter.append(i < level ? "●" : "○");
             statusView.setText("🎧 קולט שמע מהסרטון  " + meter);
             if (floatingButton instanceof TextView) ((TextView) floatingButton).setText("■");
+            updateMockSubtitle(level);
         } else if ("paused".equals(status)) {
             statusView.setText("⏸ התרגום מושהה • לחצי 🌐 להמשך");
+            hideSubtitle();
             if (floatingButton instanceof TextView) ((TextView) floatingButton).setText("🌐");
         } else if ("stopped".equals(status)) {
             statusView.setText("Live Translate • הקליטה נעצרה");
+            hideSubtitle();
             if (floatingButton instanceof TextView) ((TextView) floatingButton).setText("🌐");
         } else if ("unsupported".equals(status)) {
             statusView.setText("המכשיר לא תומך בקליטת שמע פנימי");
+            hideSubtitle();
         } else if ("capture_error".equals(status)) {
             statusView.setText("לא הצלחנו לקלוט את השמע מהסרטון");
+            hideSubtitle();
         } else if ("permission_error".equals(status)) {
             statusView.setText("נדרש אישור Android לקליטת המדיה");
+            hideSubtitle();
         }
+    }
+
+    private void updateMockSubtitle(int level) {
+        if (subtitleView == null || level <= 0) return;
+
+        long now = SystemClock.elapsedRealtime();
+        if (subtitleView.getVisibility() != View.VISIBLE || now - lastSubtitleChange >= 2500L) {
+            subtitleView.setText(mockSubtitles[subtitleIndex]);
+            subtitleView.setVisibility(View.VISIBLE);
+            subtitleIndex = (subtitleIndex + 1) % mockSubtitles.length;
+            lastSubtitleChange = now;
+        }
+    }
+
+    private void hideSubtitle() {
+        if (subtitleView != null) subtitleView.setVisibility(View.GONE);
     }
 
     private int dp(int value) {
@@ -177,6 +241,10 @@ public class OverlayService extends Service {
         if (floatingButton != null && windowManager != null) {
             windowManager.removeView(floatingButton);
             floatingButton = null;
+        }
+        if (subtitleView != null && windowManager != null) {
+            windowManager.removeView(subtitleView);
+            subtitleView = null;
         }
         if (statusView != null && windowManager != null) {
             windowManager.removeView(statusView);
