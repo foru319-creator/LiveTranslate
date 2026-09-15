@@ -38,6 +38,12 @@ dependencies {
     implementation project(':capacitor-android')
     implementation 'com.google.mlkit:language-id:17.0.6'
     implementation 'com.google.mlkit:translate:17.0.3'
+    implementation platform('com.google.firebase:firebase-bom:34.19.0')
+    implementation 'com.google.firebase:firebase-auth'
+    // Pinned to the 4.x line: okhttp 5.x's okhttp-android artifact requires
+    // compileSdk 37+, but this project is on compileSdk 36 (AAR metadata
+    // check fails otherwise).
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
     testImplementation "junit:junit:$junitVersion"
     androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
     androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"

@@ -1,0 +1,19 @@
+{
+  "name": "livetranslate-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloud Run WebSocket bridge: receives PCM audio from the Android app and streams it to Google Cloud Speech-to-Text V2 (Chirp)",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test-force-exit --test test/speechSession.test.js test/auth.test.js test/sessionLimiter.test.js"
+  },
+  "dependencies": {
+    "@google-cloud/speech": "^8.1.0",
+    "firebase-admin": "^14.4.0",
+    "ws": "^8.21.3"
+  }
+}

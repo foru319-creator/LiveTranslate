@@ -25,6 +25,17 @@ public class AudioCaptureService extends Service {
     public static final String ACTION_STOP = "com.etilevi.livetranslate.STOP_CAPTURE";
     public static final String ACTION_STATUS = "com.etilevi.livetranslate.CAPTURE_STATUS";
 
+    // Broadcast when a transcript arrives from the Cloud Run backend.
+    public static final String ACTION_TRANSCRIPT = "com.etilevi.livetranslate.TRANSCRIPT";
+    public static final String EXTRA_TEXT = "text";
+    public static final String EXTRA_LANGUAGE_CODE = "languageCode";
+    public static final String EXTRA_IS_FINAL = "isFinal";
+
+    // Broadcast when the cloud WebSocket connects/disconnects (only fired for
+    // a *sustained* disconnect, not a single quick reconnect blip).
+    public static final String ACTION_CLOUD_STATUS = "com.etilevi.livetranslate.CLOUD_STATUS";
+    public static final String EXTRA_CLOUD_CONNECTED = "cloudConnected";
+
     private static final String CHANNEL_ID = "live_translate_capture";
     private static final int NOTIFICATION_ID = 4101;
     private static final int SAMPLE_RATE = 16000;
@@ -35,10 +46,29 @@ public class AudioCaptureService extends Service {
     private volatile boolean capturing = false;
     private volatile boolean projectionReady = false;
 
+    private CloudTranscriptionClient cloudClient;
+
     @Override
     public void onCreate() {
         super.onCreate();
         createNotificationChannel();
+        cloudClient = new CloudTranscriptionClient(new CloudTranscriptionClient.Listener() {
+            @Override
+            public void onTranscript(String text, String languageCode, boolean isFinal) {
+                broadcastTranscript(text, languageCode, isFinal);
+            }
+
+            @Override
+            public void onConnectionStateChanged(boolean connected) {
+                broadcastCloudStatus(connected);
+            }
+
+            @Override
+            public void onServerNotice(String message) {
+                // Informational (e.g. server-side session cap) — the client
+                // reconnects automatically, nothing else to do here.
+            }
+        });
     }
 
     @Override
@@ -120,6 +150,7 @@ public class AudioCaptureService extends Service {
             capturing = true;
             updateNotification("קולט שמע מהסרטון");
             broadcastStatus("capturing", 0);
+            cloudClient.start();
 
             captureThread = new Thread(() -> readAudioLoop(bufferSize / 2), "LiveTranslateAudioCapture");
             captureThread.start();
@@ -132,11 +163,16 @@ public class AudioCaptureService extends Service {
 
     private void readAudioLoop(int shortBufferSize) {
         short[] buffer = new short[Math.max(shortBufferSize, 2048)];
+        byte[] pcmBytes = new byte[buffer.length * 2];
         long lastBroadcast = 0;
 
         while (capturing && audioRecord != null) {
             int read = audioRecord.read(buffer, 0, buffer.length);
             if (read <= 0) continue;
+
+            // Stream every chunk to the cloud backend for transcription,
+            // independent of the throttled level-meter broadcast below.
+            cloudClient.sendAudio(shortsToPcm16Le(buffer, read, pcmBytes), read * 2);
 
             long now = System.currentTimeMillis();
             if (now - lastBroadcast < 220) continue;
@@ -153,10 +189,24 @@ public class AudioCaptureService extends Service {
         }
     }
 
+    // AudioRecord's short[] samples are in the device's native byte order,
+    // which is little-endian on all Android devices in practice — matching
+    // exactly the LINEAR16 (PCM16LE) format the backend expects, so this is
+    // a direct byte-level repack rather than a real endianness conversion.
+    private static byte[] shortsToPcm16Le(short[] samples, int count, byte[] outBuffer) {
+        for (int i = 0; i < count; i++) {
+            short sample = samples[i];
+            outBuffer[i * 2] = (byte) (sample & 0xFF);
+            outBuffer[i * 2 + 1] = (byte) ((sample >> 8) & 0xFF);
+        }
+        return outBuffer;
+    }
+
     private synchronized void pauseCapture() {
         if (!capturing) return;
         capturing = false;
         releaseAudioRecord();
+        cloudClient.stop();
         updateNotification("הקליטה מושהית");
         broadcastStatus("paused", 0);
     }
@@ -164,6 +214,7 @@ public class AudioCaptureService extends Service {
     private void stopCaptureAndSelf() {
         capturing = false;
         releaseAudioRecord();
+        cloudClient.stop();
         if (mediaProjection != null) {
             mediaProjection.stop();
             mediaProjection = null;
@@ -189,6 +240,22 @@ public class AudioCaptureService extends Service {
         statusIntent.putExtra("status", status);
         statusIntent.putExtra("level", level);
         sendBroadcast(statusIntent);
+    }
+
+    private void broadcastTranscript(String text, String languageCode, boolean isFinal) {
+        Intent transcriptIntent = new Intent(ACTION_TRANSCRIPT);
+        transcriptIntent.setPackage(getPackageName());
+        transcriptIntent.putExtra(EXTRA_TEXT, text);
+        transcriptIntent.putExtra(EXTRA_LANGUAGE_CODE, languageCode);
+        transcriptIntent.putExtra(EXTRA_IS_FINAL, isFinal);
+        sendBroadcast(transcriptIntent);
+    }
+
+    private void broadcastCloudStatus(boolean connected) {
+        Intent cloudStatusIntent = new Intent(ACTION_CLOUD_STATUS);
+        cloudStatusIntent.setPackage(getPackageName());
+        cloudStatusIntent.putExtra(EXTRA_CLOUD_CONNECTED, connected);
+        sendBroadcast(cloudStatusIntent);
     }
 
     private void createNotificationChannel() {
@@ -223,6 +290,7 @@ public class AudioCaptureService extends Service {
     public void onDestroy() {
         capturing = false;
         releaseAudioRecord();
+        cloudClient.stop();
         if (mediaProjection != null) {
             mediaProjection.stop();
             mediaProjection = null;
