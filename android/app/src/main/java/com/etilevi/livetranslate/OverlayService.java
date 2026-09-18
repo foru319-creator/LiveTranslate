@@ -1,17 +1,14 @@
 package com.etilevi.livetranslate;
 
 import android.app.Service;
-import android.content.BroadcastReceiver;
-import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.graphics.drawable.GradientDrawable;
-import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.MotionEvent;
@@ -38,7 +35,6 @@ public class OverlayService extends Service {
     private TextView floatingButton;
     private TextView statusView;
     private TextView subtitleView;
-    private boolean receiverRegistered = false;
     private final Handler handler = new Handler(Looper.getMainLooper());
 
     private boolean captureActive = false;
@@ -48,41 +44,83 @@ public class OverlayService extends Service {
     private GradientDrawable normalButtonBackground;
     private GradientDrawable closeButtonBackground;
 
+    // How long a partial result must stay unchanged before it gets
+    // translated. Every new partial from the same utterance resets this, so
+    // translation only fires once the text has settled for a moment instead
+    // of on every tiny interim update — but short enough to still feel live.
+    private static final long PARTIAL_TRANSLATE_DEBOUNCE_MS = 400L;
+
+    // A lone word is rarely a coherent phrase on its own and translates
+    // poorly in isolation — wait for a partial to grow at least this many
+    // words before spending a translation call on it. Finals are exempt:
+    // a one-word final (e.g. "כן") is still the ground truth and must show.
+    private static final int MIN_PARTIAL_WORD_COUNT = 2;
+
+    // A partial's language has to repeat this many times in a row before it
+    // can override the source language already established for this
+    // utterance/session — one noisy reading shouldn't flip the language.
+    private static final int LANGUAGE_SWITCH_CONFIRM_COUNT = 2;
+
     private LanguageIdentifier languageIdentifier;
     private final Map<String, Translator> translators = new HashMap<>();
-    private long translationRequestId = 0L;
     private String translationStatus = "";
     private String lastTranslationSourceText;
 
-    private final BroadcastReceiver captureStatusReceiver = new BroadcastReceiver() {
+    // Monotonic ordering for transcript events (partial or final), used to
+    // make sure an async translation that resolves late (e.g. a debounced
+    // partial's translation finishing after a newer final already rendered)
+    // can never clobber something newer already on screen.
+    private long transcriptSeq = 0L;
+    private long lastRenderedSeq = -1L;
+    private Runnable pendingPartialTranslate;
+
+    // Rolling "confident source language" context for the current session:
+    // once Chirp 3 gives us a real language code (always trusted on a
+    // final; only after repeating on partials), it sticks and is reused for
+    // any later partial that arrives without its own language code, instead
+    // of guessing a different one per fragment.
+    private String stableLanguageCode;
+    private String pendingLanguageCode;
+    private int pendingLanguageStreak;
+
+    // Replaces the old captureStatusReceiver/transcriptReceiver/
+    // cloudStatusReceiver BroadcastReceivers — same three event types, now
+    // delivered as a direct in-process call via CaptureEventBus instead of
+    // a full Android system broadcast. Each handler hops to the main thread
+    // only when not already on it (runOnMain), since AudioCaptureService's
+    // audio-capture thread calls onCaptureStatus directly while the other
+    // two already arrive on the main thread.
+    private final CaptureEventBus.Listener captureEventListener = new CaptureEventBus.Listener() {
         @Override
-        public void onReceive(Context context, Intent intent) {
-            if (!AudioCaptureService.ACTION_STATUS.equals(intent.getAction())) return;
-            String status = intent.getStringExtra("status");
-            int level = intent.getIntExtra("level", 0);
-            updateCaptureStatus(status, level);
+        public void onCaptureStatus(String status, int level) {
+            runOnMain(() -> updateCaptureStatus(status, level));
+        }
+
+        @Override
+        public void onTranscript(String text, String languageCode, boolean isFinal, boolean translated, long receivedAtElapsedMs, long speechBeginAtMs, long speechEndAtMs) {
+            runOnMain(() -> handleCloudTranscript(text, languageCode, isFinal, translated, receivedAtElapsedMs, speechBeginAtMs, speechEndAtMs));
+        }
+
+        @Override
+        public void onCloudStatus(boolean connected) {
+            runOnMain(() -> {
+                cloudConnected = connected;
+                refreshCapturingStatus();
+            });
         }
     };
 
-    private final BroadcastReceiver transcriptReceiver = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            if (!AudioCaptureService.ACTION_TRANSCRIPT.equals(intent.getAction())) return;
-            String text = intent.getStringExtra(AudioCaptureService.EXTRA_TEXT);
-            String languageCode = intent.getStringExtra(AudioCaptureService.EXTRA_LANGUAGE_CODE);
-            boolean isFinal = intent.getBooleanExtra(AudioCaptureService.EXTRA_IS_FINAL, false);
-            handleCloudTranscript(text, languageCode, isFinal);
+    // Every CaptureEventBus callback (and nothing else) goes through this,
+    // so UI-touching code below always runs on the main thread regardless
+    // of which thread AudioCaptureService called notify*() from — without
+    // paying for a redundant post when already on the main thread.
+    private void runOnMain(Runnable r) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            r.run();
+        } else {
+            handler.post(r);
         }
-    };
-
-    private final BroadcastReceiver cloudStatusReceiver = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            if (!AudioCaptureService.ACTION_CLOUD_STATUS.equals(intent.getAction())) return;
-            cloudConnected = intent.getBooleanExtra(AudioCaptureService.EXTRA_CLOUD_CONNECTED, true);
-            refreshCapturingStatus();
-        }
-    };
+    }
 
     @Override
     public void onCreate() {
@@ -98,108 +136,244 @@ public class OverlayService extends Service {
                 .setConfidenceThreshold(0.2f)
                 .build();
         languageIdentifier = LanguageIdentification.getClient(languageIdOptions);
-        registerReceivers();
+        CaptureEventBus.setListener(captureEventListener);
         showFloatingButton();
         showSubtitleView();
         showStatusView();
     }
 
-    private void registerReceivers() {
-        IntentFilter statusFilter = new IntentFilter(AudioCaptureService.ACTION_STATUS);
-        IntentFilter transcriptFilter = new IntentFilter(AudioCaptureService.ACTION_TRANSCRIPT);
-        IntentFilter cloudStatusFilter = new IntentFilter(AudioCaptureService.ACTION_CLOUD_STATUS);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(captureStatusReceiver, statusFilter, Context.RECEIVER_NOT_EXPORTED);
-            registerReceiver(transcriptReceiver, transcriptFilter, Context.RECEIVER_NOT_EXPORTED);
-            registerReceiver(cloudStatusReceiver, cloudStatusFilter, Context.RECEIVER_NOT_EXPORTED);
-        } else {
-            registerReceiver(captureStatusReceiver, statusFilter);
-            registerReceiver(transcriptReceiver, transcriptFilter);
-            registerReceiver(cloudStatusReceiver, cloudStatusFilter);
-        }
-        receiverRegistered = true;
-    }
-
-    // Partial results are shown as-is (source language) for live feedback;
-    // only a final result triggers translation, since the cloud backend's
-    // isFinal already reflects real endpointing from Speech-to-Text.
-    private void handleCloudTranscript(String text, String languageCode, boolean isFinal) {
-        Log.d(TAG, "handleCloudTranscript text=\"" + text + "\" languageCode=" + languageCode + " isFinal=" + isFinal);
+    // Translation now normally happens server-side (Chirp 3 -> Cloud
+    // Translation, see backend/src/translationPipeline.js) — this just
+    // displays what the backend already translated. The on-device ML Kit
+    // pipeline below (translateToHebrew/translateWithLanguage) only runs as
+    // a *fallback* when the backend reports translated=false, i.e. Cloud
+    // Translation failed for that particular transcript server-side.
+    private void handleCloudTranscript(String text, String languageCode, boolean isFinal, boolean translated, long receivedAtElapsedMs, long speechBeginAtMs, long speechEndAtMs) {
+        Log.d(TAG, "handleCloudTranscript text=\"" + text + "\" languageCode=" + languageCode
+                + " isFinal=" + isFinal + " translated=" + translated);
         if (text == null || text.trim().isEmpty()) return;
         String trimmed = text.trim();
+        long seq = ++transcriptSeq;
 
-        if (!isFinal) {
-            showSubtitleMessage(trimmed);
+        if (translated) {
+            cancelPendingPartialTranslate();
+            displayServerTranslated(trimmed, seq, receivedAtElapsedMs, speechBeginAtMs, speechEndAtMs);
             return;
         }
-        translateToHebrew(trimmed, languageCode);
+
+        // Fallback path: server-side translation failed for this transcript
+        // — translate on-device instead, exactly like before Cloud
+        // Translation was added.
+        // Update the session's stable source language from this reading
+        // regardless of whether we end up translating it — see
+        // resolveSourceLanguage() for why a final is trusted immediately
+        // while a partial needs to repeat before it can change anything.
+        String resolvedLanguageCode = resolveSourceLanguage(languageCode, isFinal);
+
+        if (isFinal) {
+            cancelPendingPartialTranslate();
+            translateToHebrew(trimmed, resolvedLanguageCode, seq, true);
+            return;
+        }
+
+        if (countWords(trimmed) < MIN_PARTIAL_WORD_COUNT) {
+            Log.d(TAG, "handleCloudTranscript: partial too short to translate yet, waiting seq=" + seq);
+            cancelPendingPartialTranslate();
+            return;
+        }
+
+        schedulePartialTranslate(trimmed, resolvedLanguageCode, seq);
     }
 
-    private void translateToHebrew(String text, String cloudLanguageCode) {
-        Log.d(TAG, "ENTRY translateToHebrew text=\"" + text + "\" cloudLanguageCode=" + cloudLanguageCode);
+    // Fast path for the normal case: the backend already ran Cloud
+    // Translation, so this only needs the same seq-ordering guard every
+    // other rendering path uses — no ML Kit call at all.
+    private void displayServerTranslated(String text, long seq, long receivedAtElapsedMs, long speechBeginAtMs, long speechEndAtMs) {
+        if (subtitleView == null) return;
+        if (seq < lastRenderedSeq) {
+            Log.d(TAG, "SKIP: displayServerTranslated seq=" + seq + " superseded by lastRenderedSeq=" + lastRenderedSeq);
+            return;
+        }
+        lastRenderedSeq = seq;
+        translationStatus = "🌐 עברית";
+        showSubtitleMessage(text);
+        refreshCapturingStatus();
+        if (receivedAtElapsedMs > 0) {
+            long renderMs = SystemClock.elapsedRealtime() - receivedAtElapsedMs;
+            Log.i(TAG, "TIMING seq=" + seq + " androidRenderMs=" + renderMs);
+        }
+        // Cross-device latency from the *person's own speech* to this text
+        // actually being displayed — approximate, since it compares the
+        // backend's wall clock (Date.now()) to System.currentTimeMillis()
+        // here, which depends on the phone's clock being reasonably in
+        // sync (unlike androidRenderMs above, which is exact because it's
+        // entirely on-device via elapsedRealtime).
+        if (speechBeginAtMs > 0 || speechEndAtMs > 0) {
+            long displayedAtWallClockMs = System.currentTimeMillis();
+            String timing = "TIMING seq=" + seq;
+            if (speechBeginAtMs > 0) timing += " speechBeginToDisplayedMs=" + (displayedAtWallClockMs - speechBeginAtMs);
+            if (speechEndAtMs > 0) timing += " speechEndToDisplayedMs=" + (displayedAtWallClockMs - speechEndAtMs);
+            Log.i(TAG, timing + " (approximate, cross-device clock)");
+        }
+    }
+
+    private void schedulePartialTranslate(String text, String resolvedLanguageCode, long seq) {
+        cancelPendingPartialTranslate();
+        if (resolvedLanguageCode == null) {
+            // No source language established for this session/utterance at
+            // all yet — wait for a partial/final that actually carries one
+            // rather than guessing (ML Kit's text-based fallback only ever
+            // runs for finals, in translateToHebrew()).
+            Log.d(TAG, "schedulePartialTranslate: no source language known yet, skipping partial seq=" + seq);
+            return;
+        }
+        pendingPartialTranslate = () -> translateToHebrew(text, resolvedLanguageCode, seq, false);
+        handler.postDelayed(pendingPartialTranslate, PARTIAL_TRANSLATE_DEBOUNCE_MS);
+    }
+
+    private void cancelPendingPartialTranslate() {
+        if (pendingPartialTranslate != null) {
+            handler.removeCallbacks(pendingPartialTranslate);
+            pendingPartialTranslate = null;
+        }
+    }
+
+    // Chirp 3 doesn't attach a language code to every partial, and can waver
+    // between two close languages for a word or two before settling. This
+    // keeps one stable source language for the whole utterance/session
+    // instead of flipping on every reading: a final's language is trusted
+    // immediately (real STT endpointing already backs it), but a partial
+    // has to repeat LANGUAGE_SWITCH_CONFIRM_COUNT times before it can
+    // override the language already in use.
+    private String resolveSourceLanguage(String cloudLanguageCode, boolean isFinal) {
+        String normalized = normalizeLanguageTag(cloudLanguageCode);
+        if (normalized == null) {
+            return stableLanguageCode; // no signal this time; keep trusting what we already have
+        }
+        if (isFinal || stableLanguageCode == null) {
+            commitStableLanguage(normalized);
+            return stableLanguageCode;
+        }
+        if (normalized.equals(stableLanguageCode)) {
+            pendingLanguageCode = null;
+            pendingLanguageStreak = 0;
+            return stableLanguageCode;
+        }
+        if (normalized.equals(pendingLanguageCode)) {
+            pendingLanguageStreak++;
+        } else {
+            pendingLanguageCode = normalized;
+            pendingLanguageStreak = 1;
+        }
+        if (pendingLanguageStreak >= LANGUAGE_SWITCH_CONFIRM_COUNT) {
+            commitStableLanguage(pendingLanguageCode);
+        }
+        return stableLanguageCode;
+    }
+
+    private void commitStableLanguage(String normalizedTag) {
+        if (!normalizedTag.equals(stableLanguageCode)) {
+            Log.d(TAG, "source language changed: " + stableLanguageCode + " -> " + normalizedTag);
+        }
+        stableLanguageCode = normalizedTag;
+        pendingLanguageCode = null;
+        pendingLanguageStreak = 0;
+    }
+
+    private static int countWords(String text) {
+        if (text == null) return 0;
+        String trimmed = text.trim();
+        if (trimmed.isEmpty()) return 0;
+        return trimmed.split("\\s+").length;
+    }
+
+    private void translateToHebrew(String text, String resolvedLanguageCode, long seq, boolean isFinal) {
+        Log.d(TAG, "ENTRY translateToHebrew seq=" + seq + " text=\"" + text + "\" resolvedLanguageCode=" + resolvedLanguageCode + " isFinal=" + isFinal);
         if (subtitleView == null || text == null || text.isEmpty() || languageIdentifier == null) {
             Log.e(TAG, "EARLY RETURN: translateToHebrew - subtitleView=" + (subtitleView != null)
                     + " text=" + text + " languageIdentifier=" + (languageIdentifier != null));
             return;
         }
+        // A strictly newer transcript already owns the subtitle — this one
+        // is stale (e.g. a debounced partial's translation resolving after
+        // the final already rendered) and must not overwrite it.
+        if (seq < lastRenderedSeq) {
+            Log.d(TAG, "SKIP: translateToHebrew seq=" + seq + " superseded by lastRenderedSeq=" + lastRenderedSeq);
+            return;
+        }
         if (text.equals(lastTranslationSourceText)) {
-            Log.d(TAG, "EARLY RETURN: translateToHebrew - duplicate of last translated text (\"" + text + "\")");
+            Log.d(TAG, "SKIP: translateToHebrew - duplicate of last translated text (\"" + text + "\") seq=" + seq);
+            lastRenderedSeq = Math.max(lastRenderedSeq, seq);
             return;
         }
         lastTranslationSourceText = text;
 
-        final long requestId = ++translationRequestId;
-        Log.d(TAG, "translateToHebrew: proceeding, requestId=" + requestId + " text=\"" + text + "\"");
+        Log.d(TAG, "translateToHebrew: proceeding, seq=" + seq + " text=\"" + text + "\"");
 
-        String normalized = normalizeLanguageTag(cloudLanguageCode);
-        String sourceLanguage = normalized == null ? null : TranslateLanguage.fromLanguageTag(normalized);
+        String sourceLanguage = resolvedLanguageCode == null ? null : TranslateLanguage.fromLanguageTag(resolvedLanguageCode);
 
         if (sourceLanguage != null) {
-            Log.d(TAG, "translateToHebrew: using cloud-detected language=" + sourceLanguage + " requestId=" + requestId);
-            translateWithLanguage(text, sourceLanguage, requestId);
+            Log.d(TAG, "translateToHebrew: using source language=" + sourceLanguage + " seq=" + seq);
+            translateWithLanguage(text, sourceLanguage, seq, isFinal, resolvedLanguageCode);
             return;
         }
 
-        // Fallback: cloud didn't supply a usable language code — try ML
-        // Kit's text-based identification before giving up.
-        Log.d(TAG, "translateToHebrew: no usable cloud language, falling back to ML Kit identifyLanguage requestId=" + requestId);
+        if (!isFinal) {
+            // schedulePartialTranslate() already filters out language-less
+            // partials before scheduling; nothing to fall back to here.
+            return;
+        }
+
+        // Fallback for a final only: the cloud never supplied a usable
+        // language this whole utterance/session — try ML Kit's text-based
+        // identification before giving up.
+        Log.d(TAG, "translateToHebrew: no usable cloud language, falling back to ML Kit identifyLanguage seq=" + seq);
+        if (seq < lastRenderedSeq) return;
+        lastRenderedSeq = seq;
         translationStatus = "🌐 מזהה שפה";
         showSubtitleMessage("מזהה שפה…");
         refreshCapturingStatus();
 
         languageIdentifier.identifyLanguage(text)
                 .addOnSuccessListener(languageCode -> {
-                    if (requestId != translationRequestId) return;
+                    if (seq < lastRenderedSeq) return;
                     String resolved = (languageCode != null && !"und".equals(languageCode))
                             ? TranslateLanguage.fromLanguageTag(languageCode)
                             : null;
                     if (resolved == null) {
+                        lastRenderedSeq = seq;
                         translationStatus = "🌐 שפה לא זוהתה";
                         showSubtitleMessage("לא הצלחתי לזהות את שפת הדיבור: " + text);
                         refreshCapturingStatus();
                         return;
                     }
-                    translateWithLanguage(text, resolved, requestId);
+                    commitStableLanguage(languageCode);
+                    translateWithLanguage(text, resolved, seq, true, languageCode);
                 })
                 .addOnFailureListener(e -> {
-                    Log.e(TAG, "identifyLanguage FAILURE requestId=" + requestId + " text=\"" + text + "\"", e);
-                    if (requestId != translationRequestId) return;
+                    Log.e(TAG, "identifyLanguage FAILURE seq=" + seq + " text=\"" + text + "\"", e);
+                    if (seq < lastRenderedSeq) return;
+                    lastRenderedSeq = seq;
                     translationStatus = "🌐 שגיאת זיהוי שפה";
                     showSubtitleMessage("לא הצלחתי לזהות את שפת הדיבור: " + text);
                     refreshCapturingStatus();
                 });
     }
 
-    private void translateWithLanguage(String text, String sourceLanguage, long requestId) {
-        Log.d(TAG, "ENTRY translateWithLanguage requestId=" + requestId + " sourceLanguage=" + sourceLanguage + " text=\"" + text + "\"");
+    private void translateWithLanguage(String text, String sourceLanguage, long seq, boolean isFinal, String rawLanguageCode) {
+        Log.d(TAG, "ENTRY translateWithLanguage seq=" + seq + " sourceLanguage=" + sourceLanguage + " text=\"" + text + "\"");
+        if (seq < lastRenderedSeq) {
+            Log.d(TAG, "SKIP: translateWithLanguage seq=" + seq + " superseded by lastRenderedSeq=" + lastRenderedSeq);
+            return;
+        }
 
         if (TranslateLanguage.HEBREW.equals(sourceLanguage)) {
-            Log.d(TAG, "translateWithLanguage: source already Hebrew, passthrough (no ML Kit translate call) requestId=" + requestId);
-            if (requestId == translationRequestId) {
-                translationStatus = "🌐 עברית";
-                showSubtitleMessage(text);
-                refreshCapturingStatus();
-            }
+            Log.d(TAG, "translateWithLanguage: source already Hebrew, passthrough (no ML Kit translate call) seq=" + seq);
+            lastRenderedSeq = seq;
+            translationStatus = "🌐 עברית";
+            showSubtitleMessage(text);
+            refreshCapturingStatus();
+            logTranslationPair(text, rawLanguageCode, text, isFinal);
             return;
         }
 
@@ -211,10 +385,11 @@ public class OverlayService extends Service {
                     .build();
             translator = Translation.getClient(options);
             translators.put(sourceLanguage, translator);
-            Log.d(TAG, "translateWithLanguage: created NEW Translator " + sourceLanguage + "->he requestId=" + requestId);
+            Log.d(TAG, "translateWithLanguage: created NEW Translator " + sourceLanguage + "->he seq=" + seq);
         }
 
         final Translator finalTranslator = translator;
+        lastRenderedSeq = seq;
         translationStatus = "🌐 מכין תרגום";
         showSubtitleMessage("מכין תרגום לעברית…");
         refreshCapturingStatus();
@@ -222,33 +397,49 @@ public class OverlayService extends Service {
         DownloadConditions conditions = new DownloadConditions.Builder().build();
         finalTranslator.downloadModelIfNeeded(conditions)
                 .addOnSuccessListener(unused -> {
-                    if (requestId != translationRequestId) return;
+                    if (seq < lastRenderedSeq) return;
+                    lastRenderedSeq = seq;
                     translationStatus = "🌐 מתרגם";
                     showSubtitleMessage("מתרגם לעברית…");
                     refreshCapturingStatus();
 
                     finalTranslator.translate(text)
                             .addOnSuccessListener(translatedText -> {
-                                if (requestId != translationRequestId) return;
+                                if (seq < lastRenderedSeq) return;
+                                lastRenderedSeq = seq;
                                 translationStatus = "🌐 עברית";
                                 showSubtitleMessage(translatedText);
                                 refreshCapturingStatus();
+                                logTranslationPair(text, rawLanguageCode, translatedText, isFinal);
                             })
                             .addOnFailureListener(e -> {
-                                Log.e(TAG, "translate() FAILURE requestId=" + requestId + " text=\"" + text + "\"", e);
-                                if (requestId != translationRequestId) return;
+                                Log.e(TAG, "translate() FAILURE seq=" + seq + " text=\"" + text + "\"", e);
+                                if (seq < lastRenderedSeq) return;
+                                lastRenderedSeq = seq;
                                 translationStatus = "🌐 שגיאת תרגום";
                                 showSubtitleMessage("שגיאה בתרגום. הטקסט שזוהה: " + text);
                                 refreshCapturingStatus();
                             });
                 })
                 .addOnFailureListener(e -> {
-                    Log.e(TAG, "downloadModelIfNeeded FAILURE requestId=" + requestId + " sourceLanguage=" + sourceLanguage, e);
-                    if (requestId != translationRequestId) return;
+                    Log.e(TAG, "downloadModelIfNeeded FAILURE seq=" + seq + " sourceLanguage=" + sourceLanguage, e);
+                    if (seq < lastRenderedSeq) return;
+                    lastRenderedSeq = seq;
                     translationStatus = "🌐 הורדת מודל נכשלה";
                     showSubtitleMessage("לא הצלחתי להוריד את מודל התרגום. ודאי שיש אינטרנט ונסי שוב.");
                     refreshCapturingStatus();
                 });
+    }
+
+    // Diagnostic-only: lets us tell apart, from Logcat alone, whether a bad
+    // result came from Chirp 3 (SOURCE_TRANSCRIPT/SOURCE_LANGUAGE already
+    // wrong or mixed) or from ML Kit's on-device translation (SOURCE_* look
+    // right but HEBREW_TRANSLATION doesn't).
+    private void logTranslationPair(String sourceText, String sourceLanguage, String hebrewTranslation, boolean isFinal) {
+        Log.i(TAG, "SOURCE_TRANSCRIPT: " + sourceText
+                + "\nSOURCE_LANGUAGE: " + sourceLanguage
+                + "\nHEBREW_TRANSLATION: " + hebrewTranslation
+                + "\nIS_FINAL: " + isFinal);
     }
 
     private String normalizeLanguageTag(String language) {
@@ -467,10 +658,14 @@ public class OverlayService extends Service {
     }
 
     private void resetSessionState() {
+        cancelPendingPartialTranslate();
         lastTranslationSourceText = null;
-        translationRequestId++;
+        lastRenderedSeq = transcriptSeq; // invalidate any translation still in flight
         translationStatus = "";
         cloudConnected = true;
+        stableLanguageCode = null;
+        pendingLanguageCode = null;
+        pendingLanguageStreak = 0;
     }
 
     private void updateCaptureStatus(String status, int level) {
@@ -545,11 +740,10 @@ public class OverlayService extends Service {
             windowManager.removeView(statusView);
             statusView = null;
         }
-        if (receiverRegistered) {
-            try { unregisterReceiver(captureStatusReceiver); } catch (Exception ignored) {}
-            try { unregisterReceiver(transcriptReceiver); } catch (Exception ignored) {}
-            receiverRegistered = false;
-        }
+        // Must happen so AudioCaptureService's notify*() calls after this
+        // point safely no-op instead of reaching a torn-down OverlayService
+        // (its views/windowManager are already released above).
+        CaptureEventBus.clearListener(captureEventListener);
         super.onDestroy();
     }
 

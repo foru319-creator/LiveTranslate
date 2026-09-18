@@ -1,11 +1,19 @@
 package com.etilevi.livetranslate;
 
 public final class BackendConfig {
-    // TODO: replace with the real Cloud Run URL once backend/ is deployed
-    // (see backend/README or the `gcloud run deploy` output for the service
-    // URL), e.g. "wss://livetranslate-backend-xxxxx-uc.a.run.app/stream".
-    public static final String TRANSCRIPTION_WEBSOCKET_URL =
-            "wss://REPLACE_WITH_CLOUD_RUN_URL/stream";
+    private static final String TRANSCRIPTION_WEBSOCKET_BASE_URL =
+            "wss://livetranslate-backend-lkze7kpqsq-uc.a.run.app/stream";
+
+    // Translation target language sent to the backend. Hardcoded to Hebrew
+    // for now; once the UI grows a language picker, pass its selection into
+    // transcriptionWebSocketUrl() instead — the backend already honors this
+    // per-connection (see backend/src/server.js's `targetLanguage` query
+    // param), so no backend change will be needed then.
+    public static final String TARGET_LANGUAGE = "he";
+
+    public static String transcriptionWebSocketUrl(String targetLanguage) {
+        return TRANSCRIPTION_WEBSOCKET_BASE_URL + "?targetLanguage=" + targetLanguage;
+    }
 
     private BackendConfig() {
     }

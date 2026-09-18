@@ -8,6 +8,8 @@ const { getAuth } = require('firebase-admin/auth');
 const { SpeechClient } = require('@google-cloud/speech').v2;
 const SpeechSession = require('./speechSession');
 const SessionLimiter = require('./sessionLimiter');
+const TranslationClient = require('./translationClient');
+const TranslationPipeline = require('./translationPipeline');
 const { extractBearerToken, createTokenVerifier } = require('./auth');
 const config = require('./config');
 
@@ -19,6 +21,9 @@ const verifyIdToken = createTokenVerifier(getAuth(firebaseApp));
 const speechClient = new SpeechClient({
   apiEndpoint: `${config.speechLocation}-speech.googleapis.com`,
 });
+
+// Stateless and safe to share across every connection's TranslationPipeline.
+const translationClient = new TranslationClient({ projectId: config.projectId });
 
 const sessionLimiter = new SessionLimiter({
   maxConcurrentPerUid: config.maxConcurrentSessionsPerUid,
@@ -43,11 +48,16 @@ function rejectUpgrade(socket, statusCode, statusText) {
 }
 
 httpServer.on('upgrade', async (req, socket, head) => {
-  const { pathname } = new URL(req.url, 'http://localhost');
+  const { pathname, searchParams } = new URL(req.url, 'http://localhost');
   if (pathname !== '/stream') {
     rejectUpgrade(socket, 404, 'Not Found');
     return;
   }
+
+  // Lets the client pick a translation target other than the default (e.g.
+  // once the Android UI grows a language picker) without any backend
+  // change — ?targetLanguage=en alongside the existing /stream URL.
+  const targetLanguage = searchParams.get('targetLanguage') || config.defaultTargetLanguage;
 
   const token = extractBearerToken(req.headers['authorization']);
   if (!token) {
@@ -73,12 +83,13 @@ httpServer.on('upgrade', async (req, socket, head) => {
 
   wss.handleUpgrade(req, socket, head, (ws) => {
     ws.uid = uid;
+    ws.targetLanguage = targetLanguage;
     wss.emit('connection', ws, req);
   });
 });
 
 wss.on('connection', (ws) => {
-  console.log(`client connected uid=${ws.uid}`);
+  console.log(`client connected uid=${ws.uid} targetLanguage=${ws.targetLanguage}`);
 
   const session = new SpeechSession({
     speechClient,
@@ -89,14 +100,61 @@ wss.on('connection', (ws) => {
     audioChannelCount: config.audioChannelCount,
     audioEncoding: config.audioEncoding,
     restartMs: config.streamRestartMs,
+    endpointingSensitivity: config.speechEndpointingSensitivity,
+    speechEndTimeoutSeconds: config.speechEndTimeoutSeconds,
+    label: ws.uid,
+  });
+
+  const translationPipeline = new TranslationPipeline({
+    translationClient,
+    targetLanguage: ws.targetLanguage,
+    partialDebounceMs: config.translationPartialDebounceMs,
+    label: ws.uid,
   });
 
   const send = (payload) => {
     if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(payload));
   };
 
-  session.on('partial', ({ text, languageCode }) => send({ type: 'partial', text, languageCode }));
-  session.on('final', ({ text, languageCode }) => send({ type: 'final', text, languageCode }));
+  // Chirp 3's raw transcripts feed the translation pipeline instead of
+  // going straight to the client — see translationPipeline.js for the
+  // debounce/sequence/passthrough rules that turn them into Hebrew (or
+  // whatever targetLanguage is) partial/final events below.
+  session.on('partial', ({ text, languageCode, sttReceivedAtMs, speechBeginAtMs, speechEndAtMs }) =>
+    translationPipeline.handleTranscript(text, languageCode, false, sttReceivedAtMs, { speechBeginAtMs, speechEndAtMs }));
+  session.on('final', ({ text, languageCode, sttReceivedAtMs, speechBeginAtMs, speechEndAtMs }) =>
+    translationPipeline.handleTranscript(text, languageCode, true, sttReceivedAtMs, { speechBeginAtMs, speechEndAtMs }));
+
+  translationPipeline.on('translated', ({ translatedText, sourceLanguage, targetLanguage, isFinal, sttReceivedAtMs, speechBeginAtMs, speechEndAtMs }) => {
+    const sentAtMs = Date.now();
+    const sinceSttMs = sttReceivedAtMs ? sentAtMs - sttReceivedAtMs : null;
+    // speechBeginToSentMs/speechEndToSentMs: end-to-end latency from the
+    // *person's own speech* (voice-activity events) to this message
+    // leaving the server — see speechSession.js for where these originate.
+    const beginToSentMs = speechBeginAtMs ? sentAtMs - speechBeginAtMs : null;
+    const endToSentMs = speechEndAtMs ? sentAtMs - speechEndAtMs : null;
+    console.log(`[uid=${ws.uid}] sending ${isFinal ? 'final' : 'partial'} to client (translated, sourceLanguage=${sourceLanguage || '(none)'}, targetLanguage=${targetLanguage}, length=${translatedText.length}`
+      + `${sinceSttMs !== null ? `, totalSinceSttMs=${sinceSttMs}` : ''}`
+      + `${beginToSentMs !== null ? `, speechBeginToSentMs=${beginToSentMs}` : ''}`
+      + `${endToSentMs !== null ? `, speechEndToSentMs=${endToSentMs}` : ''})`);
+    send({
+      type: isFinal ? 'final' : 'partial', text: translatedText, languageCode: sourceLanguage, targetLanguage, translated: true,
+      // Wall-clock (epoch) ms, forwarded so the Android client can compute
+      // its own "speech begin -> displayed" latency — approximate, since it
+      // depends on the phone's clock being reasonably in sync (unlike
+      // SystemClock.elapsedRealtime()-based on-device measurements, which
+      // are exact but can't cross devices).
+      speechBeginAtMs, speechEndAtMs,
+    });
+  });
+  // Translation failed: fall back to sending the original, untranslated
+  // transcript with translated:false so the client can fall back to its
+  // own (ML Kit) translation rather than showing nothing.
+  translationPipeline.on('translationError', ({ text, sourceLanguage, targetLanguage, isFinal, error }) => {
+    console.error(`[uid=${ws.uid}] translation error:`, error.message || error);
+    send({ type: isFinal ? 'final' : 'partial', text, languageCode: sourceLanguage, targetLanguage, translated: false });
+  });
+
   session.on('streamError', (err) => console.error('speech stream error:', err.message || err));
   session.on('fatal', (err) => {
     console.error('speech session fatal error:', err.message || err);
@@ -126,6 +184,7 @@ wss.on('connection', (ws) => {
   const cleanup = () => {
     clearTimeout(maxDurationTimer);
     session.stop();
+    translationPipeline.stop();
     sessionLimiter.release(ws.uid);
   };
 

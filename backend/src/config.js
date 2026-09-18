@@ -18,6 +18,17 @@ const config = {
   speechLocation: process.env.SPEECH_LOCATION || 'us',
   speechModel: process.env.SPEECH_MODEL || 'chirp_3',
 
+  // Chirp 3's default endpointing (ENDPOINTING_SENSITIVITY_STANDARD) is
+  // tuned for offline-style accuracy, not live captioning, and can take
+  // ~2.4s of silence before finalizing even a short utterance. SHORT is the
+  // safer of the two faster options (vs. SUPERSHORT, which targets single
+  // words/commands and can fragment longer natural sentences) — see
+  // speechSession.js for the full rationale.
+  speechEndpointingSensitivity: process.env.SPEECH_ENDPOINTING_SENSITIVITY || 'ENDPOINTING_SENSITIVITY_SHORT',
+  // How long Chirp 3 waits in silence before finalizing the current
+  // utterance.
+  speechEndTimeoutSeconds: parseFloat(process.env.SPEECH_END_TIMEOUT_SECONDS || '1'),
+
   sampleRateHertz: parseInt(process.env.SAMPLE_RATE_HZ || '16000', 10),
   audioChannelCount: 1,
   audioEncoding: 'LINEAR16',
@@ -32,6 +43,19 @@ const config = {
   // Defaults to the same GCP project (Firebase is added on top of it), so no
   // separate project ID normally needs to be configured.
   firebaseProjectId: process.env.FIREBASE_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || 'livetranslate-508621',
+
+  // Cloud Translation target language. The client can override this per
+  // connection via a `?targetLanguage=` query param on the WebSocket URL
+  // (see server.js) — this is only the fallback when it doesn't. Hebrew for
+  // now; a future UI language picker sends the query param instead of
+  // needing any backend change.
+  defaultTargetLanguage: process.env.TARGET_LANGUAGE || 'he',
+
+  // How long a partial transcript must stay unchanged before it's sent to
+  // Cloud Translation. Every new partial resets this, so a fast run of
+  // interim updates collapses into one translation call instead of one per
+  // tiny fragment — short enough to still feel live.
+  translationPartialDebounceMs: parseInt(process.env.TRANSLATION_PARTIAL_DEBOUNCE_MS || '400', 10),
 
   // Cost/abuse controls: how many concurrent sessions one authenticated user
   // may hold, how often they may open new ones, and a hard ceiling on how

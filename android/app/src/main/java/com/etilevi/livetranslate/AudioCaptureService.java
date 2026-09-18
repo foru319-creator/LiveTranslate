@@ -15,6 +15,7 @@ import android.media.projection.MediaProjection;
 import android.media.projection.MediaProjectionManager;
 import android.os.Build;
 import android.os.IBinder;
+import android.util.Log;
 
 import androidx.core.app.NotificationCompat;
 
@@ -23,22 +24,24 @@ public class AudioCaptureService extends Service {
     public static final String EXTRA_RESULT_DATA = "resultData";
     public static final String ACTION_TOGGLE = "com.etilevi.livetranslate.TOGGLE_CAPTURE";
     public static final String ACTION_STOP = "com.etilevi.livetranslate.STOP_CAPTURE";
-    public static final String ACTION_STATUS = "com.etilevi.livetranslate.CAPTURE_STATUS";
 
-    // Broadcast when a transcript arrives from the Cloud Run backend.
-    public static final String ACTION_TRANSCRIPT = "com.etilevi.livetranslate.TRANSCRIPT";
-    public static final String EXTRA_TEXT = "text";
-    public static final String EXTRA_LANGUAGE_CODE = "languageCode";
-    public static final String EXTRA_IS_FINAL = "isFinal";
+    // Capture status, transcripts, and cloud-connection status are no
+    // longer sent as Android system broadcasts (see CaptureEventBus for
+    // why) — broadcastStatus()/broadcastTranscript()/broadcastCloudStatus()
+    // below now just forward to CaptureEventBus's in-process listener.
 
-    // Broadcast when the cloud WebSocket connects/disconnects (only fired for
-    // a *sustained* disconnect, not a single quick reconnect blip).
-    public static final String ACTION_CLOUD_STATUS = "com.etilevi.livetranslate.CLOUD_STATUS";
-    public static final String EXTRA_CLOUD_CONNECTED = "cloudConnected";
-
+    private static final String TAG = "AudioCaptureService";
     private static final String CHANNEL_ID = "live_translate_capture";
     private static final int NOTIFICATION_ID = 4101;
     private static final int SAMPLE_RATE = 16000;
+
+    // Size of each audio chunk handed to the WebSocket, independent of
+    // AudioRecord's internal capture buffer below. Google Speech-to-Text v2
+    // streaming rejects any single chunk over 25600 bytes with
+    // INVALID_ARGUMENT; 8000 samples * 2 bytes/sample (16-bit mono) = 16000
+    // bytes (500ms @ 16kHz), well under that limit with margin, and cuts
+    // latency in half versus the previous ~1s chunking.
+    private static final int CHUNK_SAMPLES = 8000;
 
     private MediaProjection mediaProjection;
     private AudioRecord audioRecord;
@@ -54,8 +57,8 @@ public class AudioCaptureService extends Service {
         createNotificationChannel();
         cloudClient = new CloudTranscriptionClient(new CloudTranscriptionClient.Listener() {
             @Override
-            public void onTranscript(String text, String languageCode, boolean isFinal) {
-                broadcastTranscript(text, languageCode, isFinal);
+            public void onTranscript(String text, String languageCode, boolean isFinal, boolean translated, long receivedAtElapsedMs, long speechBeginAtMs, long speechEndAtMs) {
+                broadcastTranscript(text, languageCode, isFinal, translated, receivedAtElapsedMs, speechBeginAtMs, speechEndAtMs);
             }
 
             @Override
@@ -120,6 +123,13 @@ public class AudioCaptureService extends Service {
     private synchronized void resumeCapture() {
         if (!projectionReady || capturing || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return;
 
+        // Kick off Firebase auth + the WebSocket + Chirp 3 stream setup
+        // first, before any AudioRecord/capture-config work below — every
+        // millisecond of head start here matters, since sendAudio() now
+        // buffers (rather than drops) audio captured before this finishes,
+        // but a bounded buffer still fills faster the later this starts.
+        cloudClient.start();
+
         try {
             AudioPlaybackCaptureConfiguration config = new AudioPlaybackCaptureConfiguration.Builder(mediaProjection)
                     .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
@@ -150,9 +160,8 @@ public class AudioCaptureService extends Service {
             capturing = true;
             updateNotification("קולט שמע מהסרטון");
             broadcastStatus("capturing", 0);
-            cloudClient.start();
 
-            captureThread = new Thread(() -> readAudioLoop(bufferSize / 2), "LiveTranslateAudioCapture");
+            captureThread = new Thread(() -> readAudioLoop(CHUNK_SAMPLES), "LiveTranslateAudioCapture");
             captureThread.start();
         } catch (Exception e) {
             capturing = false;
@@ -161,8 +170,8 @@ public class AudioCaptureService extends Service {
         }
     }
 
-    private void readAudioLoop(int shortBufferSize) {
-        short[] buffer = new short[Math.max(shortBufferSize, 2048)];
+    private void readAudioLoop(int chunkSamples) {
+        short[] buffer = new short[chunkSamples];
         byte[] pcmBytes = new byte[buffer.length * 2];
         long lastBroadcast = 0;
 
@@ -172,7 +181,9 @@ public class AudioCaptureService extends Service {
 
             // Stream every chunk to the cloud backend for transcription,
             // independent of the throttled level-meter broadcast below.
-            cloudClient.sendAudio(shortsToPcm16Le(buffer, read, pcmBytes), read * 2);
+            int chunkBytes = read * 2;
+            Log.d(TAG, "sending audio chunk: " + chunkBytes + " bytes");
+            cloudClient.sendAudio(shortsToPcm16Le(buffer, read, pcmBytes), chunkBytes);
 
             long now = System.currentTimeMillis();
             if (now - lastBroadcast < 220) continue;
@@ -234,28 +245,20 @@ public class AudioCaptureService extends Service {
         }
     }
 
+    // Named broadcastX for historical reasons (this used to be a real
+    // sendBroadcast()) — now a direct in-process call via CaptureEventBus.
+    // May be called from the audio capture thread (see readAudioLoop) or
+    // the main thread; CaptureEventBus itself is thread-safe either way.
     private void broadcastStatus(String status, int level) {
-        Intent statusIntent = new Intent(ACTION_STATUS);
-        statusIntent.setPackage(getPackageName());
-        statusIntent.putExtra("status", status);
-        statusIntent.putExtra("level", level);
-        sendBroadcast(statusIntent);
+        CaptureEventBus.notifyCaptureStatus(status, level);
     }
 
-    private void broadcastTranscript(String text, String languageCode, boolean isFinal) {
-        Intent transcriptIntent = new Intent(ACTION_TRANSCRIPT);
-        transcriptIntent.setPackage(getPackageName());
-        transcriptIntent.putExtra(EXTRA_TEXT, text);
-        transcriptIntent.putExtra(EXTRA_LANGUAGE_CODE, languageCode);
-        transcriptIntent.putExtra(EXTRA_IS_FINAL, isFinal);
-        sendBroadcast(transcriptIntent);
+    private void broadcastTranscript(String text, String languageCode, boolean isFinal, boolean translated, long receivedAtElapsedMs, long speechBeginAtMs, long speechEndAtMs) {
+        CaptureEventBus.notifyTranscript(text, languageCode, isFinal, translated, receivedAtElapsedMs, speechBeginAtMs, speechEndAtMs);
     }
 
     private void broadcastCloudStatus(boolean connected) {
-        Intent cloudStatusIntent = new Intent(ACTION_CLOUD_STATUS);
-        cloudStatusIntent.setPackage(getPackageName());
-        cloudStatusIntent.putExtra(EXTRA_CLOUD_CONNECTED, connected);
-        sendBroadcast(cloudStatusIntent);
+        CaptureEventBus.notifyCloudStatus(connected);
     }
 
     private void createNotificationChannel() {

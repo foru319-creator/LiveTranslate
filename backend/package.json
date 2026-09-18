@@ -9,10 +9,11 @@
   },
   "scripts": {
     "start": "node src/server.js",
-    "test": "node --test-force-exit --test test/speechSession.test.js test/auth.test.js test/sessionLimiter.test.js"
+    "test": "node --test-force-exit --test test/speechSession.test.js test/auth.test.js test/sessionLimiter.test.js test/translationPipeline.test.js"
   },
   "dependencies": {
     "@google-cloud/speech": "^8.1.0",
+    "@google-cloud/translate": "^10.1.0",
     "firebase-admin": "^14.4.0",
     "ws": "^8.21.3"
   }
